@@ -85,10 +85,12 @@ def seed_outage(session, start_day: date) -> int:
 
         # Ночной перезапрос окна: 4 отказа подряд открывают предохранитель,
         # оставшиеся даты окна пропускаются, но остаются в журнале.
+        night = _utc(day, 3, 0)
         for i in range(4):
+            started = night + timedelta(seconds=i * 40)
             _run(
                 session, job="sweep",
-                started_at=_utc(day, 3, 0, i * 40), finished_at=_utc(day, 3, 0, i * 40 + 32),
+                started_at=started, finished_at=started + timedelta(seconds=32),
                 status="failed", target_date=day - timedelta(days=14 - i),
                 http_status=503, attempt_count=5, duration_ms=32000,
                 error_class="SourceError",
@@ -96,9 +98,10 @@ def seed_outage(session, start_day: date) -> int:
             )
             created += 1
         for i in range(5):
+            skipped = night + timedelta(minutes=3, seconds=i * 5)
             _run(
                 session, job="sweep",
-                started_at=_utc(day, 3, 3, i * 5), finished_at=_utc(day, 3, 3, i * 5),
+                started_at=skipped, finished_at=skipped,
                 status="skipped", target_date=day - timedelta(days=10 - i),
                 attempt_count=0,
                 error_class="CircuitOpen",
