@@ -1,10 +1,11 @@
 """Планировщик.
 
 Почему задачи разнесены по разным расписаниям - см. README, требование 1.
-Кратко: ЦБ обновляет курсы один раз в сутки, обычно между 11:30 и 15:30 МСК,
-поэтому опрос идёт частыми короткими попытками внутри окна публикации
-и прекращается, как только данные за сегодня получены. Всё остальное время
-частый опрос не даёт новой информации.
+Кратко: ЦБ публикует курсы на следующий день накануне, около 13:30 МСК,
+поэтому к ночному перезапросу окна (03:00) курс «на сегодня» уже опубликован -
+основной сбор делает именно ночной проход. Дневное окно опроса - страховка:
+оно молчит, пока сегодняшняя дата разобрана, и начинает ходить в источник,
+только если ночью лежал источник или сам сервис, либо публикация сдвинулась.
 
 Два параметра APScheduler здесь принципиальны:
 
@@ -23,9 +24,9 @@ from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import text
 
 from fxwatch import jobs
+from fxwatch.calendar import DayKind, classify_days, weekday_has_history
 from fxwatch.config import get_settings
 from fxwatch.db import session_scope, wait_for_db
 from fxwatch.ingest import ingest_date, reap_stale_runs
@@ -40,22 +41,32 @@ log = logging.getLogger("fxwatch.scheduler")
 
 
 def _poll_primary() -> None:
-    """Опрос в окне публикации с ранним выходом.
+    """Дневной страховочный опрос.
 
-    Если курс за сегодня уже получен, повторный запрос ничего не добавит:
-    прогон всё равно пишется в журнал, но со статусом пропуска, чтобы в истории
-    было видно, что сервис отработал по расписанию.
+    В обычный день он не делает ни одного запроса: курс за сегодня уже забрал
+    ночной перезапрос окна. Запрос уходит в источник только если сегодняшняя
+    дата всё ещё не разобрана:
+
+    * за сегодня нет ни данных, ни успешной попытки - ночью лежал источник
+      или сам сервис, надо добирать;
+    * успешная попытка была, но данных нет, хотя по истории источника в этот
+      день недели данные бывают - публикация сдвинулась, продолжаем спрашивать.
+
+    На воскресенье и понедельник ЦБ курс не устанавливает - такие дни сервис
+    распознаёт по собственному календарю источника и не дёргает его впустую.
+    Пропуск в журнал не пишется: десяток строк «сходил зря» в день засорял бы
+    журнал, ради чистоты которого всё и построено (в лог строка попадает).
     """
     settings = get_settings()
     today = datetime.now(settings.zone).date()
     with session_scope() as session:
-        already = session.execute(
-            text("SELECT count(*) FROM observations WHERE source_code = :src AND value_date = :day"),
-            {"src": PRIMARY_SOURCE, "day": today},
-        ).scalar()
-    if already:
-        log.info("курс за %s уже получен, опрос пропущен", today)
-        return
+        kind = classify_days(session, today, today, PRIMARY_SOURCE)[today]
+        if kind == DayKind.BUSINESS:
+            log.info("курс за %s уже получен, страховочный опрос не нужен", today)
+            return
+        if kind == DayKind.NON_BUSINESS and not weekday_has_history(session, today, PRIMARY_SOURCE):
+            log.info("на %s источник курс не публикует, опрос пропущен", today)
+            return
     jobs.job_poll(PRIMARY_SOURCE)
 
 
@@ -75,12 +86,13 @@ def build_scheduler() -> BackgroundScheduler:
         job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600},
     )
 
-    # Окно публикации ЦБ: частые короткие попытки, ранний выход после успеха.
+    # Дневное страховочное окно: молчит, пока сегодняшняя дата разобрана,
+    # и ходит в источник только после ночного сбоя или сдвига публикации.
     scheduler.add_job(
         _poll_primary, CronTrigger(day_of_week="mon-fri", hour="11-15", minute="0,30"),
-        id="poll_cbr_window", name="Опрос ЦБ в окне публикации",
+        id="poll_cbr_window", name="Страховочный опрос ЦБ",
     )
-    # Подтверждающий вечерний проход: ловит публикацию, сдвинутую за окно.
+    # Вечерний контрольный проход: последний рубеж того же условия.
     scheduler.add_job(
         _poll_primary, CronTrigger(hour=23, minute=0),
         id="poll_cbr_evening", name="Вечерний контрольный опрос ЦБ",

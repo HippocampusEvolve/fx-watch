@@ -6,7 +6,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Зависимости ставим отдельным слоем: правка документации не тянет за собой pip install.
+# Код и зависимости ставятся одним слоем сознательно: editable-установка требует
+# src рядом с pyproject, а проект собирается за минуту. Если зависимостей станет
+# заметно больше, их стоит вынести в отдельный слой до COPY src.
 COPY pyproject.toml ./
 COPY src ./src
 RUN pip install --no-cache-dir -e ".[dev]"

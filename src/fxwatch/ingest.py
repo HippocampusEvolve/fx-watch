@@ -13,8 +13,10 @@
 7. сравнить с тем, что уже известно, и зафиксировать ревизии;
 8. закрыть прогон итоговым статусом.
 
-Прогон никогда не завершается «наполовину»: даже при исключении статус будет
-записан, поэтому в журнале не остаётся висящих ``running``.
+Ошибка источника закрывает прогон статусом ``failed`` прямо здесь. Если же
+процесс убили или упала сама база, запись останется в ``running`` - такие
+прогоны закрывает реапер (:func:`reap_stale_runs`) при старте и по расписанию,
+поэтому висящих ``running`` в журнале всё равно не остаётся.
 """
 
 from __future__ import annotations
@@ -341,7 +343,10 @@ def _persist(
                 abs((point.value - old_value) / old_value * Decimal(100)) if old_value else Decimal(0)
             )
             is_significant = delta_pct >= Decimal(str(settings.revision_epsilon_pct))
-            is_late = (date.today() - point.value_date).days > settings.sweep_days
+            # Дата «сегодня» берётся в таймзоне сервиса: границы окна считает
+            # планировщик по МСК, и is_late не должен разъезжаться с ним на стыке суток.
+            today_local = datetime.now(settings.zone).date()
+            is_late = (today_local - point.value_date).days > settings.sweep_days
             session.add(
                 Revision(
                     source_code=source_code, series_key=point.series_key, value_date=point.value_date,

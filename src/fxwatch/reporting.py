@@ -152,8 +152,13 @@ def detect_incidents(session: Session, start: date, end: date) -> list[Incident]
     """Сгруппировать неудачные прогоны в события.
 
     Смысл группировки в том, что «28 упавших прогонов» не говорит ничего,
-    а «два инцидента по полтора часа, оба восстановились сами, данные добраны» -
-    говорит. Читатель отчёта должен видеть события, а не строки лога.
+    а «инцидент на двое суток, восстановился сам, данные добраны» - говорит.
+    Читатель отчёта должен видеть события, а не строки лога.
+
+    Границей события служит успешный прогон, а не пауза между неудачами.
+    Во время долгого сбоя попытки идут с разной частотой - ночной перезапрос,
+    дневное окно, вечерний контроль, - и разрез по паузе дробил бы один
+    двухдневный сбой на несколько коротких, занижая его масштаб в отчёте.
     """
     rows = session.execute(
         text(
@@ -161,7 +166,7 @@ def detect_incidents(session: Session, start: date, end: date) -> list[Incident]
             SELECT source_code, started_at, status, error_class, error_message
             FROM ingest_runs
             WHERE started_at >= :start AND started_at < :end
-              AND status IN ('failed', 'skipped')
+              AND status IN ('failed', 'skipped', 'ok', 'partial')
             ORDER BY source_code, started_at
             """
         ),
@@ -170,24 +175,26 @@ def detect_incidents(session: Session, start: date, end: date) -> list[Incident]
 
     incidents: list[Incident] = []
     current: dict[str, Any] | None = None
-    #: Разрыв больше этого времени между неудачами считаем разными инцидентами.
-    gap = timedelta(hours=6)
 
     for source_code, started_at, status, error_class, error_message in rows:
-        if (
-            current is not None
-            and current["source"] == source_code
-            and started_at - current["last"] <= gap
-        ):
+        if current is not None and current["source"] != source_code:
+            incidents.append(_finalize_incident(session, current))
+            current = None
+
+        if status in ("ok", "partial"):
+            if current is not None:
+                incidents.append(_finalize_incident(session, current, recovered_at=started_at))
+                current = None
+            continue
+
+        if current is None:
+            current = {
+                "source": source_code, "first": started_at, "last": started_at, "count": 1,
+                "kind": error_class or status, "detail": (error_message or status)[:300],
+            }
+        else:
             current["last"] = started_at
             current["count"] += 1
-            continue
-        if current is not None:
-            incidents.append(_finalize_incident(session, current))
-        current = {
-            "source": source_code, "first": started_at, "last": started_at, "count": 1,
-            "kind": error_class or status, "detail": (error_message or status)[:300],
-        }
 
     if current is not None:
         incidents.append(_finalize_incident(session, current))
@@ -196,18 +203,25 @@ def detect_incidents(session: Session, start: date, end: date) -> list[Incident]
     return incidents
 
 
-def _finalize_incident(session: Session, raw: dict[str, Any]) -> Incident:
-    recovered_at = session.execute(
-        text(
-            """
-            SELECT min(started_at) FROM ingest_runs
-            WHERE source_code = :src AND started_at > :last AND status IN ('ok', 'partial')
-            """
-        ),
-        {"src": raw["source"], "last": raw["last"]},
-    ).scalar()
+def _finalize_incident(
+    session: Session, raw: dict[str, Any], recovered_at: datetime | None = None
+) -> Incident:
+    if recovered_at is None:
+        # Инцидент не закрылся внутри периода - ищем первый успех за его пределами.
+        recovered_at = session.execute(
+            text(
+                """
+                SELECT min(started_at) FROM ingest_runs
+                WHERE source_code = :src AND started_at > :last AND status IN ('ok', 'partial')
+                """
+            ),
+            {"src": raw["source"], "last": raw["last"]},
+        ).scalar()
 
-    duration = (raw["last"] - raw["first"]).total_seconds() / 60
+    # Длительность - до восстановления, а не до последней неудачи: всё это время
+    # данных не поступало, и читателю важна именно эта цифра.
+    end_stamp = recovered_at or raw["last"]
+    duration = (end_stamp - raw["first"]).total_seconds() / 60
     return Incident(
         started_at=raw["first"],
         ended_at=recovered_at,
@@ -461,6 +475,12 @@ def overview(session: Session) -> dict[str, Any]:
 # Markdown
 # --------------------------------------------------------------------------
 
+def _fmt_duration(minutes: int) -> str:
+    if minutes >= 180:
+        return f"{minutes / 60:.0f} ч"
+    return f"{minutes} мин"
+
+
 def render_markdown(report: PeriodReport) -> str:
     """Отчёт в виде файла, который можно закоммитить и прочитать без сервиса."""
     c, r, q, rev = report.coverage, report.runs, report.quality, report.revisions
@@ -513,7 +533,7 @@ def render_markdown(report: PeriodReport) -> str:
                 else "не восстановился"
             )
             lines.append(
-                f"| {incident.started_at.strftime('%d.%m.%Y %H:%M')} | {incident.duration_min} мин "
+                f"| {incident.started_at.strftime('%d.%m.%Y %H:%M')} | {_fmt_duration(incident.duration_min)} "
                 f"({incident.failed_runs} попыток) | {incident.kind} | {recovery} |"
             )
         lines.append("")

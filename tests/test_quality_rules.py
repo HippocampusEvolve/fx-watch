@@ -117,3 +117,56 @@ def test_jump_without_history_is_skipped_not_passed():
 
 def test_small_move_passes():
     assert rules.check_jump(_point("79.0"), previous=Decimal("78.5")).status == rules.PASS
+
+
+# --- уровень состояния: свежесть ------------------------------------------
+
+def test_freshness_weekend_silence_is_not_an_alarm():
+    """ЦБ не устанавливает курс на воскресенье и понедельник: 72 часа тишины - норма.
+
+    Порог в часах от последней вставки давал бы ложную тревогу каждые выходные,
+    а мониторинг, который врёт раз в неделю, перестают читать. Поэтому возраст
+    данных меряется днями без новой даты, а часами - только возраст успеха.
+    """
+    check = rules.evaluate_freshness(
+        hours_since_success=5.0, days_since_last_value=2, hours_limit=36, gap_limit_days=12
+    )
+
+    assert check.status == rules.PASS
+
+
+def test_freshness_survives_long_holidays():
+    """Новогодний перерыв в публикациях ЦБ - до 11 дней. Это ещё не тревога."""
+    check = rules.evaluate_freshness(
+        hours_since_success=6.0, days_since_last_value=11, hours_limit=36, gap_limit_days=12
+    )
+
+    assert check.status == rules.PASS
+
+
+def test_freshness_fails_when_service_stopped_polling():
+    """Успешных походов в источник давно не было - умер планировщик или сеть."""
+    check = rules.evaluate_freshness(
+        hours_since_success=40.0, days_since_last_value=1, hours_limit=36, gap_limit_days=12
+    )
+
+    assert check.status == rules.FAIL
+    assert "успешных обращений" in (check.message or "")
+
+
+def test_freshness_fails_when_source_frozen_despite_successful_polls():
+    """Источник отвечает, но новых дат нет дольше любого известного перерыва."""
+    check = rules.evaluate_freshness(
+        hours_since_success=3.0, days_since_last_value=13, hours_limit=36, gap_limit_days=12
+    )
+
+    assert check.status == rules.FAIL
+    assert "застыл" in (check.message or "")
+
+
+def test_freshness_without_any_data_fails():
+    check = rules.evaluate_freshness(
+        hours_since_success=None, days_since_last_value=None, hours_limit=36, gap_limit_days=12
+    )
+
+    assert check.status == rules.FAIL

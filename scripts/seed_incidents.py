@@ -2,7 +2,7 @@
 
 ЧЕСТНОЕ ПРЕДУПРЕЖДЕНИЕ: события, которые создаёт этот скрипт, синтетические.
 Курсы в базе настоящие - это архив Банка России. Синтетические здесь только
-записи журнала: сбои, ревизия, застой и карантин.
+записи журнала: сбой, ревизия, застой и карантин.
 
 Зачем это нужно. Требование 6 ТЗ звучит как «представьте, что сервис проработал
 три месяца». За три месяца в норме случаются сбои, и отчёт, в котором все
@@ -10,16 +10,26 @@
 работают или просто ни разу не сработали. Поэтому в историю добавлены четыре
 события, которые сервис должен уметь пережить и показать:
 
-1. источник лежал два дня подряд - сработал предохранитель, данные добраны позже;
+1. источник лежал двое суток - предохранитель открывался, часть попыток
+   пропущена осознанно, данные добраны после восстановления;
 2. источник изменил значение за уже собранную дату - ревизия;
 3. значение перестало меняться - сработала проверка застоя;
-4. пришёл битый ответ - запись ушла в карантин, остальные сохранены.
+4. пришёл битый ответ - запись ушла в карантин, остальные сохранены,
+   карантин разобран (в реальной работе это делает человек).
+
+Паттерн сбоя повторяет фактическую механику сервиса: ночной перезапрос окна
+получает четыре отказа подряд, предохранитель открывается, и оставшиеся даты
+окна пишутся со статусом ``skipped``; днём страховочное окно и вечерний контроль
+пробуют снова - предохранитель к этому времени остыл, попытки идут в сеть
+и тоже падают.
+
+Как отделить синтетику от настоящих данных. Каждая созданная здесь строка
+привязана к прогону с версией кода ``demo-seed`` (алерты - к ключам ``demo:``),
+поэтому удаляется всё одной командой:
+
+    python scripts/seed_incidents.py --clean        # или make seed-clean
 
 Скрипт идемпотентен: повторный запуск ничего не дублирует.
-Все созданные им записи помечены версией кода ``demo-seed``, поэтому их видно
-в отчёте и в любой момент можно отделить от настоящих:
-
-    DELETE FROM ingest_runs WHERE code_version = 'demo-seed';
 
 Ревизия делается аккуратно: в историю добавляется **более ранняя** версия
 значения, а не более поздняя. Текущая витрина остаётся точной копией данных ЦБ,
@@ -57,8 +67,14 @@ def already_seeded(session) -> bool:
     return bool(count)
 
 
-def _utc(day: date, hour: int, minute: int = 0) -> datetime:
-    return datetime.combine(day, time(hour, minute), tzinfo=UTC)
+def _utc(day: date, hour: int, minute: int = 0, second: int = 0) -> datetime:
+    return datetime.combine(day, time(hour, minute, second), tzinfo=UTC)
+
+
+def _run(session, **fields) -> IngestRun:
+    run = IngestRun(source_code="cbr", code_version=SEED_VERSION, **fields)
+    session.add(run)
+    return run
 
 
 def seed_outage(session, start_day: date) -> int:
@@ -66,52 +82,54 @@ def seed_outage(session, start_day: date) -> int:
     created = 0
     for offset in (0, 1):
         day = start_day + timedelta(days=offset)
-        for hour in (11, 11, 12, 12, 13, 13):
-            run = IngestRun(
-                source_code="cbr",
-                job="poll",
-                started_at=_utc(day, hour, 0 if created % 2 == 0 else 30),
-                finished_at=_utc(day, hour, 2 if created % 2 == 0 else 32),
-                status="failed",
-                target_date=day,
-                http_status=503,
-                attempt_count=5,
-                duration_ms=32000,
+
+        # Ночной перезапрос окна: 4 отказа подряд открывают предохранитель,
+        # оставшиеся даты окна пропускаются, но остаются в журнале.
+        for i in range(4):
+            _run(
+                session, job="sweep",
+                started_at=_utc(day, 3, 0, i * 40), finished_at=_utc(day, 3, 0, i * 40 + 32),
+                status="failed", target_date=day - timedelta(days=14 - i),
+                http_status=503, attempt_count=5, duration_ms=32000,
                 error_class="SourceError",
                 error_message="источник недоступен после 5 попыток: HTTP 503",
-                code_version=SEED_VERSION,
             )
-            session.add(run)
             created += 1
-
-        # После порога неудач предохранитель размыкается: следующие попытки
-        # не идут в сеть, но остаются в журнале как осознанный пропуск.
-        for hour in (14, 15):
-            session.add(
-                IngestRun(
-                    source_code="cbr", job="poll",
-                    started_at=_utc(day, hour, 0), finished_at=_utc(day, hour, 0),
-                    status="skipped", target_date=day,
-                    error_class="CircuitOpen",
-                    error_message="источник признан недоступным, попытка пропущена",
-                    code_version=SEED_VERSION,
-                )
+        for i in range(5):
+            _run(
+                session, job="sweep",
+                started_at=_utc(day, 3, 3, i * 5), finished_at=_utc(day, 3, 3, i * 5),
+                status="skipped", target_date=day - timedelta(days=10 - i),
+                attempt_count=0,
+                error_class="CircuitOpen",
+                error_message="источник признан недоступным, попытка пропущена",
             )
             created += 1
 
-    # Восстановление: данные за пропущенные дни добраны окном перезапроса.
+        # Дневное страховочное окно и вечерний контроль: дата не разобрана,
+        # поэтому сервис продолжает пробовать. Предохранитель успевает остыть
+        # между слотами, так что попытки идут в сеть и падают по-настоящему.
+        for hour, minute in ((11, 0), (11, 30), (12, 0), (13, 0), (14, 30), (23, 0)):
+            _run(
+                session, job="poll",
+                started_at=_utc(day, hour, minute), finished_at=_utc(day, hour, minute, 32),
+                status="failed", target_date=day,
+                http_status=503, attempt_count=5, duration_ms=32000,
+                error_class="SourceError",
+                error_message="источник недоступен после 5 попыток: HTTP 503",
+            )
+            created += 1
+
+    # Восстановление: на третьи сутки ночной проход добирает обе даты.
     recovery_day = start_day + timedelta(days=2)
     for offset in (0, 1):
-        session.add(
-            IngestRun(
-                source_code="cbr", job="sweep",
-                started_at=_utc(recovery_day, 3, offset * 2),
-                finished_at=_utc(recovery_day, 3, offset * 2 + 1),
-                status="ok", target_date=start_day + timedelta(days=offset),
-                http_status=200, attempt_count=1, duration_ms=1400,
-                rows_fetched=44, rows_inserted=44,
-                code_version=SEED_VERSION,
-            )
+        _run(
+            session, job="sweep",
+            started_at=_utc(recovery_day, 3, 0, offset * 2),
+            finished_at=_utc(recovery_day, 3, 0, offset * 2 + 1),
+            status="ok", target_date=start_day + timedelta(days=offset),
+            http_status=200, attempt_count=1, duration_ms=1400,
+            rows_fetched=54, rows_inserted=54,
         )
         created += 1
 
@@ -120,11 +138,14 @@ def seed_outage(session, start_day: date) -> int:
             alert_key="demo:source_down:cbr",
             severity="error",
             title="Источник cbr недоступен",
-            body="4 неудачи подряд, HTTP 503. Предохранитель открыт на 15 минут.",
-            first_fired_at=_utc(start_day, 12, 30),
-            last_fired_at=_utc(start_day + timedelta(days=1), 13, 30),
-            fire_count=2,
-            resolved_at=_utc(recovery_day, 3, 1),
+            body=(
+                "4 неудачи подряд, HTTP 503. Предохранитель открыт, оставшиеся даты "
+                "ночного окна пропущены. Повторные срабатывания копятся в счётчик."
+            ),
+            first_fired_at=_utc(start_day, 3, 2),
+            last_fired_at=_utc(start_day + timedelta(days=1), 23, 0),
+            fire_count=20,
+            resolved_at=_utc(recovery_day, 3, 0, 1),
             delivered=True,
         )
     )
@@ -135,12 +156,13 @@ def seed_revision(session) -> int:
     """Ревизия: источник изменил значение за уже собранную дату.
 
     В историю добавляется более ранняя версия, поэтому текущая витрина
-    продолжает точно повторять данные ЦБ.
+    продолжает точно повторять данные ЦБ. Ранняя версия привязана к своему
+    демонстрационному прогону, чтобы её было видно и легко удалить.
     """
     row = session.execute(
         text(
             """
-            SELECT value_date, value_num, observed_at, run_id, nominal
+            SELECT value_date, value_num, observed_at, nominal
             FROM rates_current
             WHERE source_code = 'cbr' AND series_key = 'USD/RUB'
               AND value_date < current_date - 20
@@ -151,19 +173,27 @@ def seed_revision(session) -> int:
     if row is None:
         return 0
 
-    value_date, value_num, observed_at, run_id, nominal = row
+    value_date, value_num, observed_at, nominal = row
     old_value = (Decimal(value_num) * Decimal("0.9987")).quantize(Decimal("0.0001"))
     earlier = observed_at - timedelta(hours=20)
+
+    demo_run = _run(
+        session, job="demo",
+        started_at=earlier, finished_at=earlier + timedelta(seconds=1),
+        status="ok", target_date=value_date,
+        http_status=200, attempt_count=1, duration_ms=900,
+        rows_fetched=1, rows_inserted=1,
+    )
+    session.flush()
 
     digest = hashlib.sha256(
         f"USD/RUB|{value_date.isoformat()}|{old_value:.8f}|{nominal}".encode()
     ).hexdigest()
-
     session.add(
         Observation(
             source_code="cbr", series_key="USD/RUB", value_date=value_date,
             value_num=old_value, nominal=nominal, observed_at=earlier,
-            run_id=run_id, payload_hash=digest,
+            run_id=demo_run.id, payload_hash=digest,
         )
     )
     delta = abs((Decimal(value_num) - old_value) / old_value * Decimal(100))
@@ -171,7 +201,7 @@ def seed_revision(session) -> int:
         Revision(
             source_code="cbr", series_key="USD/RUB", value_date=value_date,
             old_value=old_value, new_value=value_num, delta_pct=delta,
-            first_observed_at=earlier, revised_at=observed_at, run_id=run_id,
+            first_observed_at=earlier, revised_at=observed_at, run_id=demo_run.id,
             is_significant=True, is_late=False,
         )
     )
@@ -179,10 +209,18 @@ def seed_revision(session) -> int:
 
 
 def seed_stale(session, day: date) -> int:
-    """Срабатывание проверки застоя."""
+    """Срабатывание проверки застоя, привязанное к демонстрационному прогону."""
+    demo_run = _run(
+        session, job="demo",
+        started_at=_utc(day, 6, 20), finished_at=_utc(day, 6, 20, 1),
+        status="ok", target_date=day,
+        attempt_count=0, duration_ms=300,
+    )
+    session.flush()
+
     session.add(
         QualityCheck(
-            run_id=0, source_code="cbr", check_name="stale_series",
+            run_id=demo_run.id, source_code="cbr", check_name="stale_series",
             severity="warn", status="fail", series_key="CNY/RUB", value_date=day,
             observed="10.9812", expected="значение должно меняться",
             message="значение не менялось 3 рабочих дня подряд: 10.9812",
@@ -203,15 +241,18 @@ def seed_stale(session, day: date) -> int:
 
 
 def seed_broken_payload(session, day: date) -> int:
-    """Битый ответ: часть данных отбракована, остальные сохранены."""
-    run = IngestRun(
-        source_code="cbr", job="poll",
-        started_at=_utc(day, 11, 30), finished_at=_utc(day, 11, 30),
+    """Битый ответ: одна запись отбракована, остальные сохранены.
+
+    Карантин помечен разобранным: в реальной работе разбор делает человек,
+    и именно эта отметка отличает «система заметила и вопрос закрыт»
+    от «подозрительная запись висит без хозяина».
+    """
+    run = _run(
+        session, job="poll",
+        started_at=_utc(day, 11, 30), finished_at=_utc(day, 11, 30, 1),
         status="partial", target_date=day, http_status=200, attempt_count=1,
-        duration_ms=980, rows_fetched=44, rows_inserted=43, rows_quarantined=1,
-        code_version=SEED_VERSION,
+        duration_ms=980, rows_fetched=54, rows_inserted=53, rows_quarantined=1,
     )
-    session.add(run)
     session.flush()
 
     session.add(
@@ -219,6 +260,11 @@ def seed_broken_payload(session, day: date) -> int:
             run_id=run.id, source_code="cbr", series_key="TRY/RUB", value_date=day,
             raw_value="n/a", reason="нечисловое значение: 'n/a'", check_name="parse",
             quarantined_at=_utc(day, 11, 30),
+            resolved_at=_utc(day, 14, 45),
+            resolution=(
+                "разобрано: у источника в этой строке пришло 'n/a', значение за день "
+                "восстановлено ночным перезапросом окна. Запись демонстрационная (demo-seed)"
+            ),
         )
     )
     session.add(
@@ -232,7 +278,7 @@ def seed_broken_payload(session, day: date) -> int:
     return 1
 
 
-def main() -> int:
+def seed() -> int:
     wait_for_db()
     with session_scope() as session:
         if already_seeded(session):
@@ -246,11 +292,44 @@ def main() -> int:
         broken = seed_broken_payload(session, today - timedelta(days=11))
 
         print(
-            f"добавлено: прогонов {outage_runs}, ревизий {revisions}, "
+            f"добавлено: прогонов сбоя {outage_runs}, ревизий {revisions}, "
             f"срабатываний застоя {stale}, битых ответов {broken}"
         )
-        print("все записи помечены code_version='demo-seed'")
+        print("все записи привязаны к прогонам с code_version='demo-seed'")
     return 0
+
+
+def clean() -> int:
+    """Удалить всю синтетику. Порядок важен: сначала записи, ссылающиеся на прогоны."""
+    wait_for_db()
+    dependent = ("observations", "revisions", "quality_checks", "quarantine")
+    with session_scope() as session:
+        counts: dict[str, int] = {}
+        for table in dependent:
+            counts[table] = session.execute(
+                text(
+                    f"""
+                    DELETE FROM {table}
+                    WHERE run_id IN (SELECT id FROM ingest_runs WHERE code_version = :v)
+                    """
+                ),
+                {"v": SEED_VERSION},
+            ).rowcount
+        counts["alerts"] = session.execute(
+            text("DELETE FROM alerts WHERE alert_key LIKE 'demo:%'")
+        ).rowcount
+        counts["ingest_runs"] = session.execute(
+            text("DELETE FROM ingest_runs WHERE code_version = :v"), {"v": SEED_VERSION}
+        ).rowcount
+    print("удалена синтетика: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = argv if argv is not None else sys.argv[1:]
+    if "--clean" in args:
+        return clean()
+    return seed()
 
 
 if __name__ == "__main__":

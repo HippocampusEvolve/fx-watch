@@ -56,13 +56,21 @@ def job_sweep(source_code: str = PRIMARY_SOURCE) -> list[RunOutcome]:
     источник мог исправить значение задним числом (п. 4), сервис мог простаивать
     и что-то пропустить (п. 3), а даты старше окна считаются закрытыми, и их
     изменение уже помечается как поздняя ревизия (п. 4).
+
+    Ревизии ищутся только внутри окна, а дыры - на всю глубину истории
+    (``bootstrap_days``). Разница намеренная: перезапрашивать значения глубже
+    окна каждый день - это сотни лишних запросов ради ревизий, которых у ЦБ
+    практически не бывает, а вот дыра от простоя длиннее окна без глубокого
+    поиска осталась бы навсегда - «сервис не теряет данные» перестало бы
+    быть правдой на пятнадцатый день простоя.
     """
     settings = get_settings()
     today = datetime.now(settings.zone).date()
     window_start = today - timedelta(days=settings.sweep_days)
+    horizon_start = today - timedelta(days=settings.bootstrap_days)
 
     with session_scope() as session:
-        gaps = missing_days(session, window_start, today, source_code)
+        gaps = missing_days(session, horizon_start, today, source_code)
 
     targets = sorted({window_start + timedelta(days=i) for i in range(settings.sweep_days + 1)} | set(gaps))
     outcomes: list[RunOutcome] = []

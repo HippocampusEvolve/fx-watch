@@ -97,6 +97,31 @@ def business_days(session: Session, start: date, end: date, source_code: str = P
     return sorted(day for day, kind in kinds.items() if kind == DayKind.BUSINESS)
 
 
+def weekday_has_history(
+    session: Session, day: date, source_code: str = PRIMARY_SOURCE, weeks: int = 8
+) -> bool:
+    """Публикует ли источник данные в этот день недели - по его же истории.
+
+    ЦБ не устанавливает курс на воскресенье и понедельник, поэтому ждать
+    публикации в понедельник бессмысленно: её не будет. Вместо зашитого списка
+    «пустых» дней недели смотрим на последние N недель: если в такой день недели
+    данные ни разу не появлялись, значит источник в этот день не публикует.
+    На холодном старте истории нет, функция вернёт False - вызывающая сторона
+    должна учитывать это и не принимать False за запрет.
+    """
+    probes = [day - timedelta(weeks=w) for w in range(1, weeks + 1)]
+    count = session.execute(
+        text(
+            """
+            SELECT count(*) FROM observations
+            WHERE source_code = :src AND value_date = ANY(:dates)
+            """
+        ),
+        {"src": source_code, "dates": probes},
+    ).scalar()
+    return bool(count)
+
+
 def is_probably_business_day(day: date) -> bool:
     """Грубое приближение для холодного старта, пока истории ещё нет."""
     return day.weekday() < 5

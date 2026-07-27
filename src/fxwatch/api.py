@@ -54,6 +54,16 @@ def get_session() -> Session:
         session.close()
 
 
+def _today() -> date:
+    """Дата «сегодня» в таймзоне сервиса.
+
+    Контейнер живёт в UTC, планировщик - по МСК. Если считать «сегодня» по UTC,
+    то с полуночи до трёх ночи по Москве границы периодов в API разъезжались бы
+    с границами, по которым работает сбор.
+    """
+    return datetime.now(get_settings().zone).date()
+
+
 # --------------------------------------------------------------------------
 # Здоровье
 # --------------------------------------------------------------------------
@@ -160,7 +170,7 @@ def get_series(
     С ``as_of`` - состояние на указанный момент, то есть наблюдения, полученные
     позже, игнорируются. Разница между этими двумя выборками и есть ревизии.
     """
-    end = date.today()
+    end = _today()
     start = end - timedelta(days=days)
 
     rows = session.execute(
@@ -279,7 +289,7 @@ def get_runs(
 
 @app.get(f"{PREFIX}/incidents")
 def get_incidents(days: int = Query(90, ge=1, le=3650), session: Session = Depends(get_session)) -> dict[str, Any]:
-    end = date.today()
+    end = _today()
     start = end - timedelta(days=days)
     incidents = reporting.detect_incidents(session, start, end)
     return {"items": [i.as_dict() for i in incidents]}
@@ -291,7 +301,7 @@ def get_revisions(
     limit: int = Query(100, ge=1, le=1000),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    start = date.today() - timedelta(days=days)
+    start = _today() - timedelta(days=days)
     rows = session.execute(
         text(
             """
@@ -400,7 +410,7 @@ def get_report(
     date_to: date | None = Query(None, alias="to"),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    end = date_to or date.today()
+    end = date_to or _today()
     start = date_from or (end - timedelta(days=days))
     if start > end:
         raise HTTPException(status_code=400, detail="начало периода позже конца")
@@ -414,6 +424,8 @@ def get_report_markdown(
     date_to: date | None = Query(None, alias="to"),
     session: Session = Depends(get_session),
 ) -> str:
-    end = date_to or date.today()
+    end = date_to or _today()
     start = date_from or (end - timedelta(days=days))
+    if start > end:
+        raise HTTPException(status_code=400, detail="начало периода позже конца")
     return reporting.render_markdown(reporting.build_report(session, start, end))

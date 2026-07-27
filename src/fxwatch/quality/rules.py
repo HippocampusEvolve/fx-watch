@@ -77,7 +77,7 @@ def check_response_payload(result: FetchResult) -> CheckResult:
 def check_completeness(result: FetchResult, expected_min: int) -> CheckResult:
     """Полнота выгрузки.
 
-    ЦБ штатно отдаёт около 44 валют. Если пришло три - ответ технически корректен,
+    ЦБ штатно отдаёт около 54 валют. Если пришло три - ответ технически корректен,
     но данные неполные, и молча принять их значит испортить историю.
 
     Порог приходит от источника, а не из общей настройки: у разных источников
@@ -181,31 +181,84 @@ def check_jump(point: DataPoint, previous: Decimal | None) -> CheckResult:
 # Уровень 3. Накопленное состояние
 # --------------------------------------------------------------------------
 
-def check_freshness(session: Session, source_code: str, now: datetime | None = None) -> CheckResult:
-    """Данные вообще продолжают поступать.
+def evaluate_freshness(
+    *,
+    hours_since_success: float | None,
+    days_since_last_value: int | None,
+    hours_limit: float,
+    gap_limit_days: int,
+) -> CheckResult:
+    """Данные вообще продолжают поступать. Чистая логика без базы.
 
-    Порог с запасом: сутки штатного молчания источника плюс выходной, иначе
-    проверка будет срабатывать каждый понедельник.
+    «Перестали поступать» - это два разных сбоя, и меряются они разными линейками:
+
+    * сервис давно не мог успешно сходить в источник - умер планировщик, пропала
+      сеть, залип предохранитель. Здесь работает порог в часах;
+    * походы успешны, но новых дат не появляется. Здесь порог в часах не работает:
+      ЦБ не устанавливает курс на воскресенье и понедельник, и штатная тишина
+      с субботы до вторника - 72 часа, а новогодняя - до 11 дней. Мерить возраст
+      последней вставки часами значило бы получать ложную тревогу каждые выходные.
+      Поэтому порог - календарные дни без единой новой даты, с запасом на самый
+      длинный известный перерыв в публикациях источника.
     """
+    if hours_since_success is None:
+        return CheckResult("freshness", ERROR, FAIL, "по источнику нет ни одного успешного обращения")
+    if days_since_last_value is None:
+        return CheckResult("freshness", ERROR, FAIL, "по источнику нет ни одного наблюдения")
+
+    observed = f"успех {hours_since_success:.1f} ч назад, свежая дата {days_since_last_value} дн назад"
+
+    if hours_since_success > hours_limit:
+        return CheckResult(
+            "freshness", ERROR, FAIL,
+            f"успешных обращений к источнику не было {hours_since_success:.1f} ч",
+            observed=observed, expected=f"успех не старше {hours_limit:.0f} ч",
+        )
+    if days_since_last_value > gap_limit_days:
+        return CheckResult(
+            "freshness", ERROR, FAIL,
+            f"обращения успешны, но новых дат нет уже {days_since_last_value} дн - "
+            f"источник застыл или молчит дольше любого известного перерыва",
+            observed=observed, expected=f"новая дата не реже раза в {gap_limit_days} дн",
+        )
+    return CheckResult(
+        "freshness", ERROR, PASS,
+        observed=observed,
+        expected=f"успех <= {hours_limit:.0f} ч, новая дата <= {gap_limit_days} дн",
+    )
+
+
+def check_freshness(session: Session, source_code: str, now: datetime | None = None) -> CheckResult:
+    """Обёртка над :func:`evaluate_freshness`: достаёт из базы оба возраста."""
     settings = get_settings()
     now = now or datetime.now(UTC)
-    row = session.execute(
-        text("SELECT max(observed_at) FROM observations WHERE source_code = :src"),
+
+    last_success = session.execute(
+        text(
+            """
+            SELECT max(started_at) FROM ingest_runs
+            WHERE source_code = :src AND status IN ('ok', 'partial')
+            """
+        ),
+        {"src": source_code},
+    ).scalar()
+    last_value_date = session.execute(
+        text("SELECT max(value_date) FROM observations WHERE source_code = :src"),
         {"src": source_code},
     ).scalar()
 
-    if row is None:
-        return CheckResult("freshness", ERROR, FAIL, "по источнику нет ни одного наблюдения")
-
-    age_hours = (now - row).total_seconds() / 3600
-    observed = f"{age_hours:.1f} ч"
-    if age_hours > settings.freshness_hours:
-        return CheckResult(
-            "freshness", ERROR, FAIL,
-            f"последние данные получены {observed} назад",
-            observed=observed, expected=f"<= {settings.freshness_hours} ч",
-        )
-    return CheckResult("freshness", ERROR, PASS, observed=observed, expected=f"<= {settings.freshness_hours} ч")
+    return evaluate_freshness(
+        hours_since_success=(
+            (now - last_success).total_seconds() / 3600 if last_success else None
+        ),
+        days_since_last_value=(
+            (now.astimezone(settings.zone).date() - last_value_date).days
+            if last_value_date
+            else None
+        ),
+        hours_limit=settings.freshness_hours,
+        gap_limit_days=settings.freshness_max_gap_days,
+    )
 
 
 def check_stale_series(session: Session, source_code: str, series_key: str, today: date) -> CheckResult:
