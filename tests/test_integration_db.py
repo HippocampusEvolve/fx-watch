@@ -113,6 +113,26 @@ def source():
         REGISTRY.pop(scripted.code, None)
 
 
+@pytest.fixture
+def primary_source():
+    """Тот же управляемый источник, но под кодом основного.
+
+    Нужен там, где проверяется отчёт: покрытие и календарь считаются
+    по основному источнику, поэтому подставной код тут не подходит.
+    """
+    from fxwatch.sources import PRIMARY_SOURCE, REGISTRY
+
+    scripted = ScriptedSource()
+    scripted.code = PRIMARY_SOURCE
+    scripted.reported_date = date.today()
+    original = REGISTRY[PRIMARY_SOURCE]
+    REGISTRY[PRIMARY_SOURCE] = scripted
+    try:
+        yield scripted
+    finally:
+        REGISTRY[PRIMARY_SOURCE] = original
+
+
 def _fetch_one(sql: str, **params):
     from fxwatch.db import session_scope
 
@@ -293,19 +313,24 @@ def test_quarantine_merges_repeated_problem(source):
     assert _scalar("SELECT count(*) FROM observations") == 1, "годное значение сохраняется"
 
 
-def test_verdict_does_not_ignore_open_alerts(source):
-    """Вердикт отчёта обязан смотреть на весь отчёт, а не на его часть."""
+def test_verdict_does_not_ignore_open_alerts(primary_source):
+    """Вердикт отчёта обязан смотреть на весь отчёт, а не на его часть.
+
+    Период - один сегодняшний день: так покрытие честно равно ста процентам,
+    и единственное, что отличает два вердикта, - открытый алерт.
+    """
     from fxwatch.alerting import raise_alert
     from fxwatch.db import session_scope
     from fxwatch.ingest import ingest_date
     from fxwatch.quality import rules
     from fxwatch.reporting import build_report
 
-    ingest_date(source.code, DAY, job="test")
     today = date.today()
+    ingest_date(primary_source.code, today, job="test")
 
     with session_scope() as session:
-        clean = build_report(session, today - timedelta(days=30), today)
+        clean = build_report(session, today, today)
+        assert clean.coverage["coverage_pct"] == 100.0
         assert "вмешательство не требуется" in clean.verdict
 
         raise_alert(
@@ -314,7 +339,7 @@ def test_verdict_does_not_ignore_open_alerts(source):
         )
 
     with session_scope() as session:
-        report = build_report(session, today - timedelta(days=30), today)
+        report = build_report(session, today, today)
 
     assert "Требует внимания" in report.verdict
     assert "открытых алертов: 1" in report.verdict
