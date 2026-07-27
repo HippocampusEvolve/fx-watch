@@ -1,0 +1,80 @@
+# Полный стенд одной командой:  docker compose up -d
+#
+# Внешних ключей и секретов не требуется - оба источника (ЦБ РФ и open.er-api.com)
+# работают без авторизации. При первом старте worker сам забирает историю
+# за FXWATCH_BOOTSTRAP_DAYS дней, чтобы дашборд не был пустым.
+
+x-app-env: &app-env
+  FXWATCH_DB_DSN: postgresql+psycopg://fxwatch:fxwatch@db:5432/fxwatch
+  FXWATCH_TZ: Europe/Moscow
+  FXWATCH_BOOTSTRAP_DAYS: "90"
+  FXWATCH_SWEEP_DAYS: "14"
+  FXWATCH_CODE_VERSION: ${CODE_VERSION:-dev}
+  FXWATCH_ALERT_WEBHOOK: ${FXWATCH_ALERT_WEBHOOK:-}
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fxwatch
+      POSTGRES_PASSWORD: fxwatch
+      POSTGRES_DB: fxwatch
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fxwatch -d fxwatch"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # Миграции отдельным одноразовым шагом: api и worker стартуют только после
+  # его успешного завершения, гонки за схему нет.
+  migrate:
+    build:
+      context: .
+      args:
+        CODE_VERSION: ${CODE_VERSION:-dev}
+    command: ["migrate"]
+    environment: *app-env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      args:
+        CODE_VERSION: ${CODE_VERSION:-dev}
+    command: ["api"]
+    environment: *app-env
+    ports:
+      # Локально открывается на всех интерфейсах, на сервере переопределяется
+      # на 127.0.0.1:8790 - наружу API отдаёт nginx.
+      - "${FXWATCH_API_BIND:-8790}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/live', timeout=4).status==200 else 1)\""]
+      interval: 15s
+      timeout: 6s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      args:
+        CODE_VERSION: ${CODE_VERSION:-dev}
+    command: ["worker"]
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:

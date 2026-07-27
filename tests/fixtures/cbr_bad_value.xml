@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="windows-1251"?>
+<ValCurs Date="15.07.2026" name="Foreign Currency Market">
+<Valute ID="R01235"><NumCode>840</NumCode><CharCode>USD</CharCode><Nominal>1</Nominal><Name>Доллар США</Name><Value>n/a</Value><VunitRate>n/a</VunitRate></Valute>
+<Valute ID="R01239"><NumCode>978</NumCode><CharCode>EUR</CharCode><Nominal>0</Nominal><Name>Евро</Name><Value>91,2340</Value><VunitRate>91,234</VunitRate></Valute>
+<Valute ID="R01375"><NumCode>156</NumCode><CharCode>CNY</CharCode><Nominal>1</Nominal><Name>Китайский юань</Name><Value>-10,9812</Value><VunitRate>-10,9812</VunitRate></Valute>
+<Valute ID="R01010"><NumCode>036</NumCode><CharCode>AUD</CharCode><Nominal>1</Nominal><Name>Австралийский доллар</Name><Value>54,7273</Value><VunitRate>54,7273</VunitRate></Valute>
+</ValCurs>
