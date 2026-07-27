@@ -282,6 +282,7 @@ DELETE FROM ingest_runs WHERE code_version = 'demo-seed';
 ## Устройство
 
 ```
+dashboard/            одна статическая страница, без сборки и зависимостей
 src/fxwatch/
   sources/            интерфейс источника и его реализации
     base.py           DataPoint, FetchResult, контракт Source

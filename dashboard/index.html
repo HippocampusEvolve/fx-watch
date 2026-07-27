@@ -1,0 +1,908 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>fx-watch: сбор данных с историей ревизий | antonov-ai.ru</title>
+  <meta name="description" content="Сервис регулярно забирает курсы ЦБ РФ, хранит историю изменений, отслеживает ревизии источника и качество данных. Живой дашборд с машиной времени.">
+  <link rel="canonical" href="https://antonov-ai.ru/agents/fxwatch/">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="fx-watch: сбор данных с историей ревизий">
+  <meta property="og:description" content="Курсы ЦБ РФ, история изменений, ревизии источника, контроль качества данных и отчёт за период.">
+  <meta property="og:url" content="https://antonov-ai.ru/agents/fxwatch/">
+  <meta property="og:image" content="https://antonov-ai.ru/assets/og-preview.svg">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #07080f;
+      color: #f4f1ea;
+      --bg: #07080f;
+      --panel: rgba(12, 15, 26, 0.72);
+      --panel-strong: rgba(12, 15, 26, 0.88);
+      --line: rgba(219, 232, 236, 0.14);
+      --line-strong: rgba(219, 232, 236, 0.26);
+      --text: #f4f1ea;
+      --muted: rgba(244, 241, 234, 0.74);
+      --muted-strong: rgba(244, 241, 234, 0.86);
+      --ok: #7ee2a8;
+      --warn: #f0c674;
+      --bad: #f08d8d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh; min-height: 100dvh;
+      margin: 0;
+      background:
+        radial-gradient(circle at 18% 12%, rgba(255, 255, 255, 0.12), transparent 30%),
+        radial-gradient(circle at 86% 76%, rgba(255, 255, 255, 0.09), transparent 34%),
+        var(--bg);
+      color: var(--text);
+    }
+    a { color: inherit; }
+    button, input, select { font: inherit; color: inherit; }
+
+    #neural-canvas {
+      position: fixed; inset: 0; z-index: 0;
+      width: 100%; height: 100%;
+      pointer-events: none; opacity: 0.28;
+    }
+
+    .shell {
+      position: relative; z-index: 1;
+      width: min(1460px, 100%);
+      margin: 0 auto;
+      padding: clamp(18px, 4vw, 34px);
+      display: grid;
+      gap: clamp(16px, 2.6vw, 24px);
+      align-content: start;
+    }
+
+    .topbar { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    .back-button {
+      position: relative;
+      min-height: 42px;
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 0 16px;
+      border: 1px solid rgba(255, 255, 255, 0.42);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.08);
+      color: #ffffff;
+      text-decoration: none;
+      font-weight: 720;
+      line-height: 1;
+      transition: background 220ms ease, border-color 220ms ease, transform 220ms ease;
+    }
+    .back-button:hover, .back-button:focus-visible {
+      border-color: rgba(255, 255, 255, 0.78);
+      background: rgba(255, 255, 255, 0.16);
+      transform: translateY(-1px);
+      outline: none;
+    }
+    .back-arrow {
+      width: 14px; height: 14px;
+      border-left: 1.6px solid currentColor;
+      border-bottom: 1.6px solid currentColor;
+      transform: rotate(45deg);
+      margin-right: 2px;
+    }
+    .repo-link {
+      margin-left: auto;
+      font-size: 0.86rem; color: var(--muted);
+      text-decoration: none; border-bottom: 1px solid var(--line-strong);
+      padding-bottom: 2px;
+    }
+    .repo-link:hover { color: var(--text); }
+
+    .header { display: grid; gap: 10px; }
+    h1 {
+      margin: 0;
+      font-size: clamp(2.1rem, 5vw, 3.3rem);
+      line-height: 1; font-weight: 780;
+      letter-spacing: -0.01em;
+    }
+    .lede {
+      margin: 0;
+      color: var(--muted);
+      font-size: clamp(0.98rem, 1.7vw, 1.06rem);
+      line-height: 1.55;
+      max-width: 780px;
+    }
+
+    .status-strip {
+      display: flex; flex-wrap: wrap;
+      gap: 10px 22px;
+      padding: 12px 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      backdrop-filter: blur(14px);
+      font-size: 0.88rem;
+      color: var(--muted-strong);
+      align-items: center;
+    }
+    .status-strip strong { color: #fff; font-weight: 720; }
+    .dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      background: var(--ok); margin-right: 7px; vertical-align: middle;
+      box-shadow: 0 0 10px currentColor;
+    }
+    .dot.warn { background: var(--warn); }
+    .dot.bad { background: var(--bad); }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(178px, 1fr));
+      gap: 12px;
+    }
+    .metric {
+      padding: 16px 18px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--panel);
+      backdrop-filter: blur(14px);
+      display: grid; gap: 6px;
+    }
+    .metric .label {
+      font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--muted); font-weight: 700;
+    }
+    .metric .value { font-size: 1.85rem; font-weight: 760; line-height: 1; }
+    .metric .value.small { font-size: 1.25rem; }
+    .metric .note { font-size: 0.8rem; color: var(--muted); line-height: 1.4; }
+    .metric.good .value { color: var(--ok); }
+    .metric.warn .value { color: var(--warn); }
+    .metric.bad  .value { color: var(--bad); }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--panel);
+      backdrop-filter: blur(14px);
+      padding: clamp(16px, 2.4vw, 22px);
+      display: grid; gap: 14px;
+    }
+    .panel h2 {
+      margin: 0; font-size: 1.12rem; font-weight: 740;
+      display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    }
+    .panel h2 .sub { font-size: 0.83rem; color: var(--muted); font-weight: 400; }
+
+    .controls { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip {
+      padding: 6px 13px;
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.24);
+      cursor: pointer;
+      font-size: 0.86rem;
+      font-weight: 620;
+      transition: background 180ms ease, border-color 180ms ease;
+    }
+    .chip:hover { border-color: rgba(255, 255, 255, 0.6); }
+    .chip[aria-pressed="true"] {
+      background: rgba(255, 255, 255, 0.9);
+      color: #07080f;
+      border-color: #fff;
+    }
+    .control-label {
+      font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--muted); font-weight: 700;
+    }
+    select {
+      padding: 7px 11px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: rgba(0, 0, 0, 0.34);
+      outline: none;
+    }
+
+    .chart-wrap { position: relative; width: 100%; overflow-x: auto; }
+    svg.chart { display: block; width: 100%; height: auto; min-width: 520px; }
+    .grid-line { stroke: rgba(219, 232, 236, 0.11); stroke-width: 1; }
+    .axis-text { fill: rgba(244, 241, 234, 0.55); font-size: 11px; }
+    .series-line { fill: none; stroke: #ffffff; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+    .series-area { fill: url(#areaGradient); }
+    .ghost-line {
+      fill: none; stroke: var(--warn); stroke-width: 1.6;
+      stroke-dasharray: 4 4; opacity: 0.85;
+    }
+    .rev-marker { fill: var(--warn); stroke: #07080f; stroke-width: 1.4; }
+    .hover-line { stroke: rgba(255, 255, 255, 0.42); stroke-width: 1; stroke-dasharray: 3 3; }
+    .hover-dot { fill: #fff; stroke: #07080f; stroke-width: 2; }
+
+    .tooltip {
+      position: absolute; pointer-events: none;
+      padding: 8px 11px;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: rgba(7, 8, 15, 0.95);
+      font-size: 0.82rem; line-height: 1.5;
+      white-space: nowrap;
+      opacity: 0; transition: opacity 140ms ease;
+      z-index: 5;
+    }
+    .tooltip.is-visible { opacity: 1; }
+    .tooltip b { font-weight: 720; }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 0.82rem; color: var(--muted); }
+    .legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .swatch { width: 16px; height: 3px; border-radius: 2px; background: #fff; }
+    .swatch.ghost { background: repeating-linear-gradient(90deg, var(--warn) 0 4px, transparent 4px 8px); height: 2px; }
+    .swatch.dot-marker { width: 9px; height: 9px; border-radius: 50%; background: var(--warn); }
+
+    .timemachine {
+      display: grid; gap: 10px;
+      padding: 14px 16px;
+      border: 1px dashed var(--line-strong);
+      border-radius: 9px;
+      background: rgba(0, 0, 0, 0.2);
+    }
+    .timemachine .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .timemachine input[type=range] { flex: 1 1 260px; accent-color: #fff; }
+    .timemachine .hint { font-size: 0.82rem; color: var(--muted); line-height: 1.5; }
+    .tm-value { font-weight: 720; min-width: 118px; font-size: 0.88rem; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 0.87rem; }
+    th, td { padding: 9px 10px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 700; }
+    tr:last-child td { border-bottom: none; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .table-scroll { overflow-x: auto; }
+    .tag {
+      display: inline-block; padding: 2px 8px; border-radius: 999px;
+      font-size: 0.74rem; font-weight: 700; border: 1px solid currentColor;
+    }
+    .tag.ok { color: var(--ok); }
+    .tag.warn { color: var(--warn); }
+    .tag.bad { color: var(--bad); }
+    .tag.mute { color: var(--muted); }
+
+    .two-col { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: clamp(14px, 2.2vw, 20px); }
+
+    .howto { display: grid; gap: 16px; }
+    .howto .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+    .howto .step {
+      padding: 15px 17px; border: 1px solid var(--line); border-radius: 9px;
+      background: rgba(0, 0, 0, 0.2); display: grid; gap: 7px; align-content: start;
+    }
+    .howto .step .n {
+      width: 26px; height: 26px; border-radius: 50%;
+      border: 1px solid var(--line-strong);
+      display: grid; place-items: center; font-size: 0.8rem; font-weight: 740;
+    }
+    .howto .step h3 { margin: 0; font-size: 0.98rem; font-weight: 720; }
+    .howto .step p { margin: 0; font-size: 0.87rem; color: var(--muted); line-height: 1.5; }
+
+    .empty { color: var(--muted); font-size: 0.88rem; padding: 6px 0; }
+    .error-box {
+      padding: 12px 15px; border: 1px solid var(--bad); border-radius: 8px;
+      background: rgba(240, 141, 141, 0.08); color: var(--bad); font-size: 0.88rem;
+    }
+    footer {
+      color: var(--muted); font-size: 0.83rem; line-height: 1.6;
+      padding-top: 4px; border-top: 1px solid var(--line);
+    }
+    .skeleton {
+      display: inline-block; min-width: 44px; height: 0.85em;
+      background: linear-gradient(90deg, rgba(255,255,255,0.06), rgba(255,255,255,0.16), rgba(255,255,255,0.06));
+      background-size: 200% 100%; border-radius: 4px;
+      animation: shimmer 1.4s infinite;
+    }
+    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+    @media (prefers-reduced-motion: reduce) { .skeleton { animation: none; } }
+  </style>
+</head>
+<body>
+<canvas id="neural-canvas" aria-hidden="true"></canvas>
+
+<div class="shell">
+  <div class="topbar">
+    <a class="back-button" href="/"><span class="back-arrow"></span>На главную</a>
+    <a class="repo-link" href="https://github.com/HippocampusEvolve/fx-watch" target="_blank" rel="noopener">Исходный код на GitHub</a>
+  </div>
+
+  <header class="header">
+    <h1>fx-watch</h1>
+    <p class="lede">
+      Сервис каждый день сам забирает официальные курсы Банка России, складывает их так, что видна
+      вся история изменений, и следит за тем, чтобы данные не сломались незаметно. Это живой стенд:
+      цифры ниже приходят из работающего сервиса, а не из заготовки.
+    </p>
+  </header>
+
+  <div class="status-strip" id="status-strip">
+    <span><span class="dot" id="health-dot"></span><span id="health-text">проверяю состояние</span></span>
+    <span>Источник: <strong>Банк России</strong></span>
+    <span>Последний сбор: <strong id="last-run"><span class="skeleton"></span></strong></span>
+    <span>Версия кода: <strong id="code-version"><span class="skeleton"></span></strong></span>
+  </div>
+
+  <section class="metrics" id="metrics"></section>
+
+  <section class="panel">
+    <h2>Курс во времени <span class="sub">точки графика берутся из истории наблюдений, а не из последнего ответа источника</span></h2>
+
+    <div class="controls">
+      <span class="control-label">Валюта</span>
+      <div class="chips" id="currency-chips"></div>
+      <select id="currency-select" aria-label="Другая валюта"></select>
+      <span class="control-label" style="margin-left:auto">Период</span>
+      <div class="chips" id="period-chips">
+        <button class="chip" data-days="30" aria-pressed="false">30 дней</button>
+        <button class="chip" data-days="90" aria-pressed="true">90 дней</button>
+        <button class="chip" data-days="180" aria-pressed="false">полгода</button>
+      </div>
+    </div>
+
+    <div class="chart-wrap" id="chart-wrap">
+      <svg class="chart" id="chart" viewBox="0 0 1000 360" preserveAspectRatio="none" role="img" aria-label="График курса"></svg>
+      <div class="tooltip" id="tooltip"></div>
+    </div>
+
+    <div class="legend">
+      <span><i class="swatch"></i>Текущее знание</span>
+      <span><i class="swatch ghost"></i>Что мы знали на выбранный момент</span>
+      <span><i class="swatch dot-marker"></i>Источник менял это значение</span>
+    </div>
+
+    <div class="timemachine">
+      <div class="row">
+        <span class="control-label">Машина времени</span>
+        <input type="range" id="asof-range" min="0" max="100" value="100" aria-label="Показать данные на прошлый момент">
+        <span class="tm-value" id="asof-value">сейчас</span>
+        <button class="chip" id="asof-reset">Сбросить</button>
+      </div>
+      <p class="hint">
+        Сдвиньте ползунок влево, чтобы увидеть данные такими, какими они были известны сервису на тот момент.
+        Где пунктир расходится со сплошной линией, источник позже поправил своё же значение.
+        Ради этого история и хранится целиком: любой прошлый отчёт можно воспроизвести и проверить.
+      </p>
+      <p class="hint">
+        Честная оговорка: история за три месяца залита из архива Банка России за один заход,
+        поэтому почти все значения сервис узнал одновременно, и на раннем положении ползунка
+        график будет коротким. Разница между тем, что мы знали и знаем, видна там, где источник
+        действительно менял значение.
+      </p>
+    </div>
+  </section>
+
+  <div class="two-col">
+    <section class="panel">
+      <h2>Что ломалось <span class="sub">сбои сгруппированы в события</span></h2>
+      <div class="table-scroll"><table id="incidents-table">
+        <thead><tr><th>Когда</th><th>Что случилось</th><th>Длилось</th><th>Итог</th></tr></thead>
+        <tbody><tr><td colspan="4" class="empty">загрузка</td></tr></tbody>
+      </table></div>
+    </section>
+
+    <section class="panel">
+      <h2>Ревизии источника <span class="sub">значения, изменённые задним числом</span></h2>
+      <div class="table-scroll"><table id="revisions-table">
+        <thead><tr><th>Ряд</th><th>Дата</th><th class="num">Было</th><th class="num">Стало</th><th class="num">Разница</th></tr></thead>
+        <tbody><tr><td colspan="5" class="empty">загрузка</td></tr></tbody>
+      </table></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <h2>Проверки качества данных <span class="sub">за последние 7 дней</span></h2>
+    <div class="table-scroll"><table id="checks-table">
+      <thead><tr><th>Проверка</th><th>Что проверяет</th><th class="num">Пройдено</th><th class="num">Не пройдено</th><th class="num">Пропущено</th></tr></thead>
+      <tbody><tr><td colspan="5" class="empty">загрузка</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section class="panel howto">
+    <h2>Как это работает, если коротко</h2>
+    <div class="steps">
+      <div class="step">
+        <span class="n">1</span>
+        <h3>Забирает данные несколько раз в день</h3>
+        <p>Банк России публикует курс один раз в сутки, обычно днём. Сервис заходит за ним каждые полчаса
+           в окне публикации и останавливается, как только получил. Если источник не ответил, он подождёт
+           и попробует снова, а не бросит попытку.</p>
+      </div>
+      <div class="step">
+        <span class="n">2</span>
+        <h3>Ничего не перезаписывает</h3>
+        <p>Каждое полученное значение добавляется новой строкой с отметкой, когда оно пришло. Поэтому видно
+           не только каким курс был, но и что сервис знал о нём в любой прошлый день.</p>
+      </div>
+      <div class="step">
+        <span class="n">3</span>
+        <h3>Раз в сутки перепроверяет две недели назад</h3>
+        <p>Источник иногда правит уже опубликованные значения. Ночью сервис заново запрашивает последние
+           14 дней: так он замечает правки и заодно добирает всё, что мог пропустить, пока был недоступен.</p>
+      </div>
+      <div class="step">
+        <span class="n">4</span>
+        <h3>Проверяет, что данные не сломались</h3>
+        <p>Пустой ответ, три валюты вместо сорока, отрицательный курс, скачок в десять раз, значение,
+           которое перестало меняться. Подозрительная запись откладывается в сторону, а остальные
+           сохраняются: одна плохая строка не должна отменять весь день.</p>
+      </div>
+      <div class="step">
+        <span class="n">5</span>
+        <h3>Ведёт журнал каждого захода</h3>
+        <p>Когда, сколько попыток, сколько строк, какая версия кода работала. Через три месяца по этому
+           журналу собирается отчёт, который отвечает на вопрос, всё ли было в порядке, цифрами, а не на словах.</p>
+      </div>
+      <div class="step">
+        <span class="n">6</span>
+        <h3>Сообщает, только когда есть что делать</h3>
+        <p>Повторное срабатывание той же проблемы не шлёт новое письмо, иначе через месяц их перестанут
+           читать. Отдельно отслеживается обратное: если задача вдруг перестала запускаться, это тоже сигнал.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    Курсы настоящие, из архива Банка России. Часть событий в журнале, а именно два сбоя источника,
+    одна ревизия и одно срабатывание проверки застоя, добавлены отдельным скриптом: за короткий срок
+    настоящих сбоев не набралось, а показать надо было именно то, как система их переживает.
+    Такие записи помечены версией <code>demo-seed</code> и отделимы одним запросом.
+    Подробности, обоснования решений и отчёт за период лежат в
+    <a href="https://github.com/HippocampusEvolve/fx-watch" target="_blank" rel="noopener">репозитории</a>.
+  </footer>
+</div>
+
+<script>
+(() => {
+  'use strict';
+  const API = '/api/fxwatch';
+  const state = {
+    series: 'USD/RUB',
+    days: 90,
+    points: [],
+    revisions: [],
+    asOfIndex: null,
+    ghost: [],
+    observedStamps: [],
+  };
+
+  const fmt = {
+    num: (v, digits = 4) => Number(v).toLocaleString('ru-RU', { minimumFractionDigits: digits, maximumFractionDigits: digits }),
+    money: (v) => Number(v).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 4 }),
+    date: (iso) => new Date(iso + (iso.length === 10 ? 'T00:00:00' : '')).toLocaleDateString('ru-RU', { day: '2-digit', month: 'short' }),
+    dateFull: (iso) => new Date(iso).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' }),
+    stamp: (iso) => new Date(iso).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }),
+    ago: (iso) => {
+      const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+      if (diff < 90) return 'только что';
+      if (diff < 5400) return Math.round(diff / 60) + ' мин назад';
+      if (diff < 172800) return Math.round(diff / 3600) + ' ч назад';
+      return Math.round(diff / 86400) + ' дн назад';
+    },
+  };
+
+  async function api(path) {
+    const response = await fetch(API + path, { headers: { 'Accept': 'application/json' } });
+    if (!response.ok) throw new Error('HTTP ' + response.status + ' на ' + path);
+    return response.json();
+  }
+
+  function showError(message) {
+    const strip = document.getElementById('status-strip');
+    strip.insertAdjacentHTML('afterend', '<div class="error-box">Не удалось получить данные сервиса: ' + message + '</div>');
+  }
+
+  // ---------- верхняя панель и метрики ----------
+
+  function renderHealth(health) {
+    const dot = document.getElementById('health-dot');
+    const text = document.getElementById('health-text');
+    const primary = (health.sources || []).find(s => s.source_code === 'cbr');
+    const ok = health.status === 'ok';
+    dot.className = 'dot' + (ok ? '' : ' warn');
+    text.textContent = ok ? 'сервис работает штатно' : 'работает с замечаниями';
+    document.getElementById('code-version').textContent = health.code_version || '-';
+    if (primary && primary.last_success_at) {
+      document.getElementById('last-run').textContent = fmt.ago(primary.last_success_at);
+    }
+  }
+
+  function metric(label, value, note, tone) {
+    return '<div class="metric ' + (tone || '') + '">' +
+      '<span class="label">' + label + '</span>' +
+      '<span class="value' + (String(value).length > 9 ? ' small' : '') + '">' + value + '</span>' +
+      '<span class="note">' + note + '</span></div>';
+  }
+
+  function renderOverview(data) {
+    const cov = data.coverage_90d || {};
+    const totals = data.totals || {};
+    const gaps = (cov.gap_days || []).length;
+    const coverageTone = cov.coverage_pct >= 100 ? 'good' : (cov.coverage_pct >= 95 ? 'warn' : 'bad');
+    const usd = (data.latest || []).find(x => x.series_key === 'USD/RUB');
+
+    const cards = [
+      metric('Покрытие за 90 дней', (cov.coverage_pct ?? 0) + '%',
+        gaps ? ('нет данных за ' + gaps + ' дн.') : 'данные есть за каждый рабочий день', coverageTone),
+      metric('Наблюдений в базе', (totals.observations || 0).toLocaleString('ru-RU'),
+        (totals.series || 0) + ' валютных рядов'),
+      metric('Обращений к источнику', (totals.runs || 0).toLocaleString('ru-RU'),
+        'каждое записано в журнал'),
+      metric('Ревизий источника', (totals.revisions || 0).toLocaleString('ru-RU'),
+        'значений, изменённых задним числом'),
+      metric('В карантине', (totals.quarantine_open || 0).toLocaleString('ru-RU'),
+        'записей отложено как подозрительные',
+        totals.quarantine_open ? 'warn' : 'good'),
+    ];
+    if (usd) {
+      cards.unshift(metric('Доллар США', fmt.money(usd.value),
+        'на ' + fmt.dateFull(usd.value_date)));
+    }
+    document.getElementById('metrics').innerHTML = cards.join('');
+  }
+
+  // ---------- график ----------
+
+  function buildPath(points, x, y) {
+    return points.map((p, i) => (i ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(p.value).toFixed(1)).join(' ');
+  }
+
+  function renderChart() {
+    const svg = document.getElementById('chart');
+    const points = state.points;
+    if (!points.length) {
+      svg.innerHTML = '<text x="500" y="180" text-anchor="middle" class="axis-text">нет данных за период</text>';
+      return;
+    }
+
+    const W = 1000, H = 360, padL = 62, padR = 18, padT = 18, padB = 34;
+    const values = points.map(p => p.value).concat(state.ghost.map(p => p.value));
+    let min = Math.min(...values), max = Math.max(...values);
+    const span = (max - min) || Math.abs(max) * 0.02 || 1;
+    min -= span * 0.12; max += span * 0.12;
+
+    const x = i => padL + (points.length > 1 ? i / (points.length - 1) : 0.5) * (W - padL - padR);
+    const y = v => padT + (1 - (v - min) / (max - min)) * (H - padT - padB);
+
+    const parts = [
+      '<defs><linearGradient id="areaGradient" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0%" stop-color="rgba(255,255,255,0.18)"/>' +
+      '<stop offset="100%" stop-color="rgba(255,255,255,0)"/></linearGradient></defs>'
+    ];
+
+    const ticks = 5;
+    for (let i = 0; i <= ticks; i++) {
+      const value = min + (max - min) * (i / ticks);
+      const py = y(value);
+      parts.push('<line class="grid-line" x1="' + padL + '" y1="' + py.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + py.toFixed(1) + '"/>');
+      parts.push('<text class="axis-text" x="' + (padL - 8) + '" y="' + (py + 4).toFixed(1) + '" text-anchor="end">' + fmt.num(value, 2) + '</text>');
+    }
+
+    const step = Math.max(1, Math.floor(points.length / 8));
+    for (let i = 0; i < points.length; i += step) {
+      parts.push('<text class="axis-text" x="' + x(i).toFixed(1) + '" y="' + (H - 12) + '" text-anchor="middle">' + fmt.date(points[i].date) + '</text>');
+    }
+
+    const line = buildPath(points, x, y);
+    parts.push('<path class="series-area" d="' + line + ' L ' + x(points.length - 1).toFixed(1) + ' ' + (H - padB) + ' L ' + x(0).toFixed(1) + ' ' + (H - padB) + ' Z"/>');
+    parts.push('<path class="series-line" d="' + line + '"/>');
+
+    if (state.ghost.length > 1) {
+      const byDate = new Map(state.ghost.map(p => [p.date, p.value]));
+      const ghostPoints = points.map(p => ({ date: p.date, value: byDate.get(p.date) }))
+        .filter(p => p.value !== undefined);
+      if (ghostPoints.length > 1) {
+        const indexOf = new Map(points.map((p, i) => [p.date, i]));
+        const d = ghostPoints.map((p, i) => (i ? 'L' : 'M') + x(indexOf.get(p.date)).toFixed(1) + ' ' + y(p.value).toFixed(1)).join(' ');
+        parts.push('<path class="ghost-line" d="' + d + '"/>');
+      }
+    }
+
+    const revisedDates = new Set(state.revisions.map(r => r.date));
+    points.forEach((p, i) => {
+      if (revisedDates.has(p.date)) {
+        parts.push('<circle class="rev-marker" cx="' + x(i).toFixed(1) + '" cy="' + y(p.value).toFixed(1) + '" r="4.5"/>');
+      }
+    });
+
+    parts.push('<g id="hover-layer"></g>');
+    parts.push('<rect id="hit-area" x="' + padL + '" y="' + padT + '" width="' + (W - padL - padR) + '" height="' + (H - padT - padB) + '" fill="transparent"/>');
+    svg.innerHTML = parts.join('');
+
+    attachHover(svg, points, x, y, { W, padL, padR, padT, padB, H });
+  }
+
+  function attachHover(svg, points, x, y, geo) {
+    const wrap = document.getElementById('chart-wrap');
+    const tooltip = document.getElementById('tooltip');
+    const layer = svg.querySelector('#hover-layer');
+    const hit = svg.querySelector('#hit-area');
+    if (!hit) return;
+
+    const move = (event) => {
+      const rect = svg.getBoundingClientRect();
+      const clientX = event.touches ? event.touches[0].clientX : event.clientX;
+      const relative = (clientX - rect.left) / rect.width * geo.W;
+      const ratio = (relative - geo.padL) / (geo.W - geo.padL - geo.padR);
+      const index = Math.max(0, Math.min(points.length - 1, Math.round(ratio * (points.length - 1))));
+      const point = points[index];
+      if (!point) return;
+
+      const px = x(index), py = y(point.value);
+      layer.innerHTML =
+        '<line class="hover-line" x1="' + px.toFixed(1) + '" y1="' + geo.padT + '" x2="' + px.toFixed(1) + '" y2="' + (geo.H - geo.padB) + '"/>' +
+        '<circle class="hover-dot" cx="' + px.toFixed(1) + '" cy="' + py.toFixed(1) + '" r="4.5"/>';
+
+      const revision = state.revisions.find(r => r.date === point.date);
+      tooltip.innerHTML = '<b>' + fmt.dateFull(point.date) + '</b><br>' +
+        state.series + ': <b>' + fmt.money(point.value) + '</b>' +
+        (revision ? '<br>источник менял: ' + fmt.money(revision.old_value) + ' на ' + fmt.money(revision.new_value) : '');
+      tooltip.classList.add('is-visible');
+
+      const left = px / geo.W * wrap.clientWidth;
+      tooltip.style.left = Math.min(Math.max(left + 12, 8), wrap.clientWidth - tooltip.offsetWidth - 8) + 'px';
+      tooltip.style.top = (py / 360 * svg.getBoundingClientRect().height) + 'px';
+    };
+
+    hit.addEventListener('mousemove', move);
+    hit.addEventListener('touchmove', move, { passive: true });
+    hit.addEventListener('mouseleave', () => {
+      tooltip.classList.remove('is-visible');
+      layer.innerHTML = '';
+    });
+  }
+
+  // ---------- загрузка рядов ----------
+
+  async function loadSeries() {
+    const data = await api('/series?code=' + encodeURIComponent(state.series) + '&days=' + state.days);
+    state.points = data.points || [];
+    state.revisions = data.revisions || [];
+    state.ghost = [];
+
+    const stamps = Array.from(new Set(state.points.map(p => p.observed_at))).sort();
+    state.observedStamps = stamps;
+    const range = document.getElementById('asof-range');
+    range.max = String(Math.max(1, stamps.length - 1));
+    range.value = range.max;
+    document.getElementById('asof-value').textContent = 'сейчас';
+
+    renderChart();
+  }
+
+  async function loadGhost(stamp) {
+    const data = await api('/series?code=' + encodeURIComponent(state.series) + '&days=' + state.days + '&as_of=' + encodeURIComponent(stamp));
+    state.ghost = data.points || [];
+    renderChart();
+
+    // Показываем, сколько значений сервис знал на выбранный момент: без этого
+    // короткий пунктир выглядит как поломка, а не как отсутствие знания.
+    const label = document.getElementById('asof-value');
+    label.textContent = fmt.stamp(stamp) + ' (знал ' + state.ghost.length + ' из ' + state.points.length + ')';
+  }
+
+  // ---------- таблицы ----------
+
+  function renderIncidents(items) {
+    const body = document.querySelector('#incidents-table tbody');
+    if (!items.length) {
+      body.innerHTML = '<tr><td colspan="4" class="empty">За период сбоев не было.</td></tr>';
+      return;
+    }
+    body.innerHTML = items.slice(0, 8).map(i => {
+      const kind = i.kind.includes('CircuitOpen') ? 'источник признан недоступным, попытки приостановлены'
+        : i.kind.includes('SourceError') ? 'источник не отвечал'
+        : i.kind.includes('QualityGate') ? 'ответ не прошёл проверку качества'
+        : i.detail;
+      return '<tr><td>' + fmt.stamp(i.started_at) + '</td><td>' + kind + '</td>' +
+        '<td class="num">' + i.duration_min + ' мин</td>' +
+        '<td>' + (i.recovered
+          ? '<span class="tag ok">восстановился сам</span>'
+          : '<span class="tag bad">не восстановился</span>') + '</td></tr>';
+    }).join('');
+  }
+
+  function renderRevisions(items) {
+    const body = document.querySelector('#revisions-table tbody');
+    if (!items.length) {
+      body.innerHTML = '<tr><td colspan="5" class="empty">Источник не менял ранее отданные значения.</td></tr>';
+      return;
+    }
+    body.innerHTML = items.slice(0, 8).map(r =>
+      '<tr><td>' + r.series_key + (r.is_late ? ' <span class="tag warn">поздняя</span>' : '') + '</td>' +
+      '<td>' + fmt.dateFull(r.value_date) + '</td>' +
+      '<td class="num">' + fmt.money(r.old_value) + '</td>' +
+      '<td class="num">' + fmt.money(r.new_value) + '</td>' +
+      '<td class="num">' + Number(r.delta_pct).toFixed(3) + '%</td></tr>'
+    ).join('');
+  }
+
+  const CHECK_HINTS = {
+    response_payload: 'ответ вообще содержит данные',
+    completeness: 'валют пришло столько, сколько ожидаем',
+    reported_date: 'дата в ответе совпадает с запрошенной',
+    value_range: 'курс положительный и в разумных пределах',
+    jump: 'нет скачка относительно предыдущего дня',
+    freshness: 'данные продолжают поступать',
+    stale_series: 'значение не застыло на месте',
+    cross_source: 'сходится с независимым источником',
+  };
+
+  function renderChecks(summary) {
+    const body = document.querySelector('#checks-table tbody');
+    const names = Object.keys(summary || {});
+    if (!names.length) {
+      body.innerHTML = '<tr><td colspan="5" class="empty">За период проверок не записано.</td></tr>';
+      return;
+    }
+    body.innerHTML = names.map(name => {
+      const row = summary[name];
+      const failed = row.fail || 0;
+      return '<tr><td>' + (row.title || name) +
+        (failed ? ' <span class="tag warn">срабатывала</span>' : '') + '</td>' +
+        '<td>' + (CHECK_HINTS[name] || '') + '</td>' +
+        '<td class="num">' + (row.pass || 0) + '</td>' +
+        '<td class="num">' + failed + '</td>' +
+        '<td class="num">' + (row.skip || 0) + '</td></tr>';
+    }).join('');
+  }
+
+  // ---------- управление ----------
+
+  function setupCurrencyControls(items) {
+    const preferred = ['USD/RUB', 'EUR/RUB', 'CNY/RUB', 'GBP/RUB'];
+    const available = items.map(i => i.series_key);
+    const chips = document.getElementById('currency-chips');
+    chips.innerHTML = preferred.filter(k => available.includes(k)).map(k =>
+      '<button class="chip" data-series="' + k + '" aria-pressed="' + (k === state.series) + '">' + k.split('/')[0] + '</button>'
+    ).join('');
+
+    const select = document.getElementById('currency-select');
+    select.innerHTML = '<option value="">ещё валюта</option>' +
+      items.filter(i => !preferred.includes(i.series_key))
+        .map(i => '<option value="' + i.series_key + '">' + i.code + '</option>').join('');
+
+    chips.addEventListener('click', (event) => {
+      const button = event.target.closest('.chip');
+      if (!button) return;
+      state.series = button.dataset.series;
+      select.value = '';
+      syncPressed(chips, 'series', state.series);
+      loadSeries().catch(e => showError(e.message));
+    });
+
+    select.addEventListener('change', () => {
+      if (!select.value) return;
+      state.series = select.value;
+      syncPressed(chips, 'series', null);
+      loadSeries().catch(e => showError(e.message));
+    });
+  }
+
+  function syncPressed(container, attribute, value) {
+    container.querySelectorAll('.chip').forEach(chip => {
+      chip.setAttribute('aria-pressed', String(chip.dataset[attribute] === value));
+    });
+  }
+
+  function setupPeriodControls() {
+    const chips = document.getElementById('period-chips');
+    chips.addEventListener('click', (event) => {
+      const button = event.target.closest('.chip');
+      if (!button) return;
+      state.days = Number(button.dataset.days);
+      syncPressed(chips, 'days', String(state.days));
+      loadSeries().catch(e => showError(e.message));
+    });
+  }
+
+  function setupTimeMachine() {
+    const range = document.getElementById('asof-range');
+    const label = document.getElementById('asof-value');
+    let timer = null;
+
+    range.addEventListener('input', () => {
+      const index = Number(range.value);
+      const stamps = state.observedStamps;
+      if (!stamps.length) return;
+      if (index >= stamps.length - 1) {
+        label.textContent = 'сейчас';
+        state.ghost = [];
+        renderChart();
+        return;
+      }
+      const stamp = stamps[index];
+      label.textContent = fmt.stamp(stamp);
+      clearTimeout(timer);
+      timer = setTimeout(() => loadGhost(stamp).catch(e => showError(e.message)), 180);
+    });
+
+    document.getElementById('asof-reset').addEventListener('click', () => {
+      range.value = range.max;
+      label.textContent = 'сейчас';
+      state.ghost = [];
+      renderChart();
+    });
+  }
+
+  // ---------- фон ----------
+
+  function startCanvas() {
+    const canvas = document.getElementById('neural-canvas');
+    if (!canvas || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const ctx = canvas.getContext('2d');
+    let nodes = [], raf = null;
+
+    const resize = () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      const count = Math.min(48, Math.floor(window.innerWidth / 34));
+      nodes = Array.from({ length: count }, () => ({
+        x: Math.random() * canvas.width,
+        y: Math.random() * canvas.height,
+        vx: (Math.random() - 0.5) * 0.22,
+        vy: (Math.random() - 0.5) * 0.22,
+      }));
+    };
+
+    const frame = () => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      nodes.forEach(n => {
+        n.x += n.vx; n.y += n.vy;
+        if (n.x < 0 || n.x > canvas.width) n.vx *= -1;
+        if (n.y < 0 || n.y > canvas.height) n.vy *= -1;
+      });
+      ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          const dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
+          const dist = Math.hypot(dx, dy);
+          if (dist < 150) {
+            ctx.globalAlpha = 1 - dist / 150;
+            ctx.beginPath();
+            ctx.moveTo(nodes[i].x, nodes[i].y);
+            ctx.lineTo(nodes[j].x, nodes[j].y);
+            ctx.stroke();
+          }
+        }
+      }
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      nodes.forEach(n => { ctx.beginPath(); ctx.arc(n.x, n.y, 1.5, 0, Math.PI * 2); ctx.fill(); });
+      raf = requestAnimationFrame(frame);
+    };
+
+    resize();
+    window.addEventListener('resize', () => { cancelAnimationFrame(raf); resize(); frame(); });
+    frame();
+  }
+
+  // ---------- старт ----------
+
+  async function init() {
+    startCanvas();
+    setupPeriodControls();
+    setupTimeMachine();
+
+    try {
+      const [health, overview, currencies] = await Promise.all([
+        api('/health'), api('/overview'), api('/currencies'),
+      ]);
+      renderHealth(health);
+      renderOverview(overview);
+      setupCurrencyControls(currencies.items || []);
+      await loadSeries();
+    } catch (error) {
+      showError(error.message);
+      return;
+    }
+
+    api('/incidents?days=90').then(d => renderIncidents(d.items || [])).catch(() => {});
+    api('/revisions?days=90').then(d => renderRevisions(d.items || [])).catch(() => {});
+    api('/checks?days=7').then(d => renderChecks(d.summary || {})).catch(() => {});
+  }
+
+  document.addEventListener('DOMContentLoaded', init);
+})();
+</script>
+</body>
+</html>
