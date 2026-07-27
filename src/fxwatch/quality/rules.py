@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 
 from fxwatch.calendar import DayKind, classify_days
 from fxwatch.config import get_settings
+from fxwatch.sources import PRIMARY_SOURCE
 from fxwatch.sources.base import DataPoint, FetchResult
 from fxwatch.sources.erapi import TRACKED as _SECONDARY_TRACKED
 
@@ -333,27 +334,23 @@ def check_stale_series(
     return CheckResult("stale_series", WARN, PASS, series_key=series_key, value_date=recent[-1])
 
 
-def latest_comparable_date(session: Session, series_key: str, since: date) -> date | None:
-    """Последняя дата, за которую есть значения обоих источников.
+def latest_secondary_date(session: Session, series_key: str, since: date) -> date | None:
+    """Последняя дата, за которую вообще есть значение второго источника.
 
-    Сверять «за сегодня» нельзя: ЦБ не устанавливает курс на воскресенье
-    и понедельник, и в эти дни сверка гарантированно пропускалась бы, хотя
-    сравнить есть что - за пятницу или субботу данные обоих источников уже
-    лежат в базе. Поэтому проверка идёт по последней дате, где сравнение
-    вообще возможно, а не по календарному «сегодня».
+    Второй источник отдаёт только текущее состояние, поэтому его дата - это,
+    как правило, сегодня, а у ЦБ курс на сегодня может отсутствовать: на
+    воскресенье и понедельник он не устанавливается. Совпадения дат ждать
+    бессмысленно, и именно поэтому сверка «за сегодня» пропускалась два дня
+    из семи, а на забэкфилленной истории - всегда.
     """
     return session.execute(
         text(
             """
-            SELECT value_date FROM observations
-            WHERE series_key = :series AND value_date >= :since
-            GROUP BY value_date
-            HAVING count(DISTINCT source_code) >= 2
-            ORDER BY value_date DESC
-            LIMIT 1
+            SELECT max(value_date) FROM observations
+            WHERE series_key = :series AND source_code <> :primary AND value_date >= :since
             """
         ),
-        {"series": series_key, "since": since},
+        {"series": series_key, "primary": PRIMARY_SOURCE, "since": since},
     ).scalar()
 
 
@@ -361,46 +358,65 @@ def check_cross_source(session: Session, series_key: str, value_date: date) -> C
     """Сверка двух независимых источников по одному ряду.
 
     Ловит класс ошибок, невидимый изнутри одного источника: технически валидный,
-    но неверный на порядок курс. Если второго значения за дату нет - проверка
-    пропускается, а не засчитывается пройденной.
+    но неверный на порядок курс.
+
+    Сравниваются не значения за одинаковую дату, а **действующие** значения:
+    курс ЦБ действует до следующей публикации, поэтому рыночному курсу за
+    воскресенье соответствует официальный курс, установленный на субботу.
+    Требование одинаковой даты выглядело строже, но на практике означало бы,
+    что проверка не срабатывает никогда: у второго источника нет истории,
+    а у ЦБ нет курса на два дня недели.
+
+    Если сравнивать не с чем, проверка пропускается, а не засчитывается
+    пройденной: зелёная галочка, за которой ничего не стоит, хуже пропуска.
     """
     settings = get_settings()
-    rows = session.execute(
+    secondary = session.execute(
         text(
             """
-            SELECT DISTINCT ON (source_code) source_code, value_num
-            FROM observations
-            WHERE series_key = :series AND value_date = :day
-            ORDER BY source_code, observed_at DESC
+            SELECT value_num FROM observations
+            WHERE series_key = :series AND source_code <> :primary AND value_date = :day
+            ORDER BY last_seen_at DESC LIMIT 1
             """
         ),
-        {"series": series_key, "day": value_date},
-    ).all()
+        {"series": series_key, "primary": PRIMARY_SOURCE, "day": value_date},
+    ).scalar()
 
-    values = {row[0]: row[1] for row in rows}
-    if len(values) < 2:
+    effective = session.execute(
+        text(
+            """
+            SELECT value_num, value_date FROM observations
+            WHERE series_key = :series AND source_code = :primary AND value_date <= :day
+            ORDER BY value_date DESC, last_seen_at DESC LIMIT 1
+            """
+        ),
+        {"series": series_key, "primary": PRIMARY_SOURCE, "day": value_date},
+    ).first()
+
+    if secondary is None or effective is None or not effective[0]:
         return CheckResult(
             "cross_source", WARN, SKIP,
-            "второго источника за эту дату нет, сверять не с чем",
+            "нет пары значений для сравнения: второй источник или официальный курс отсутствуют",
             series_key=series_key, value_date=value_date,
         )
 
-    primary = values.get("cbr")
-    secondary = next((v for k, v in values.items() if k != "cbr"), None)
-    if primary is None or secondary is None or primary == 0:
-        return CheckResult("cross_source", WARN, SKIP, series_key=series_key, value_date=value_date)
-
+    primary, primary_date = effective
     delta_pct = abs((primary - secondary) / primary * Decimal(100))
     observed = f"{delta_pct:.2f}%"
+    detail = (
+        f"официальный курс {primary} за {primary_date.isoformat()} "
+        f"против рыночного {secondary} за {value_date.isoformat()}"
+    )
     if delta_pct > Decimal(str(settings.cross_source_warn_pct)):
         return CheckResult(
             "cross_source", WARN, FAIL,
-            f"источники расходятся на {observed}: {primary} против {secondary}",
+            f"источники расходятся на {observed}: {detail}",
             series_key=series_key, value_date=value_date,
             observed=observed, expected=f"<= {settings.cross_source_warn_pct}%",
         )
     return CheckResult(
-        "cross_source", WARN, PASS, series_key=series_key, value_date=value_date, observed=observed
+        "cross_source", WARN, PASS, detail,
+        series_key=series_key, value_date=value_date, observed=observed,
     )
 
 

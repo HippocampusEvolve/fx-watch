@@ -313,6 +313,47 @@ def test_quarantine_merges_repeated_problem(source):
     assert _scalar("SELECT count(*) FROM observations") == 1, "годное значение сохраняется"
 
 
+def test_cross_source_compares_effective_rate(primary_source):
+    """Сверка сравнивает действующий курс, а не значения за одинаковую дату.
+
+    Второй источник отдаёт только сегодняшнее состояние, а ЦБ не устанавливает
+    курс на воскресенье и понедельник. Требование одинаковой даты означало бы,
+    что проверка не срабатывает вообще никогда.
+    """
+    from fxwatch.db import session_scope
+    from fxwatch.ingest import ingest_date
+    from fxwatch.quality import rules
+
+    saturday = date(2026, 7, 25)
+    monday = saturday + timedelta(days=2)
+
+    primary_source.reported_date = saturday
+    primary_source.values = {"USD/RUB": "78.03"}
+    ingest_date(primary_source.code, saturday, job="test")
+
+    # Второй источник: значение за понедельник, официального курса за этот день нет.
+    with session_scope() as session:
+        session.execute(
+            text(
+                """
+                INSERT INTO observations
+                    (source_code, series_key, value_date, value_num, nominal,
+                     observed_at, last_seen_at, run_id, payload_hash)
+                VALUES ('erapi', 'USD/RUB', :day, 78.0336, 1, now(), now(), 0, 'test-hash')
+                """
+            ),
+            {"day": monday},
+        )
+
+    with session_scope() as session:
+        comparable = rules.latest_secondary_date(session, "USD/RUB", saturday - timedelta(days=14))
+        check = rules.check_cross_source(session, "USD/RUB", comparable)
+
+    assert comparable == monday
+    assert check.status == rules.PASS, check.message
+    assert "2026-07-25" in (check.message or ""), "сравнение должно идти с курсом, действующим на дату"
+
+
 def test_verdict_does_not_ignore_open_alerts(primary_source):
     """Вердикт отчёта обязан смотреть на весь отчёт, а не на его часть.
 

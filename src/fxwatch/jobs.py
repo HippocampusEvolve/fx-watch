@@ -146,18 +146,18 @@ def job_state_checks(source_code: str = PRIMARY_SOURCE) -> list[rules.CheckResul
         for series in all_series:
             results.append(rules.check_stale_series(session, source_code, series, today, business_days=business))
 
-        # Сверка идёт по последней дате, за которую есть оба источника: у второго
-        # источника нет истории, а у ЦБ нет курса на воскресенье и понедельник,
-        # поэтому привязка к «сегодня» оставляла бы проверку вечно пропущенной.
+        # Сверка привязана к последнему значению второго источника, а официальный
+        # курс берётся действующий на эту дату. Требовать совпадения дат нельзя:
+        # у второго источника нет истории, а ЦБ не устанавливает курс
+        # на воскресенье и понедельник - проверка пропускалась бы всегда.
         since = today - timedelta(days=CROSS_SOURCE_LOOKBACK_DAYS)
         for series in rules.CROSS_CHECKED_SERIES:
-            comparable = rules.latest_comparable_date(session, series, since)
+            comparable = rules.latest_secondary_date(session, series, since)
             if comparable is None:
                 results.append(
                     rules.CheckResult(
                         "cross_source", rules.WARN, rules.SKIP,
-                        f"за последние {CROSS_SOURCE_LOOKBACK_DAYS} дней нет даты, "
-                        "которую отдали оба источника",
+                        f"второй источник не отвечал последние {CROSS_SOURCE_LOOKBACK_DAYS} дней",
                         series_key=series,
                     )
                 )
