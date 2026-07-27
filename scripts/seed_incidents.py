@@ -42,10 +42,16 @@ import hashlib
 import sys
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 from sqlalchemy import text
 
-sys.path.insert(0, "/app/src")
+# Скрипт запускается и в контейнере, и с хоста, поэтому путь к пакету
+# вычисляется от собственного расположения, а не задаётся строкой «/app/src»:
+# зашитый путь молча ломает запуск на машине разработчика.
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if _SRC.is_dir():
+    sys.path.insert(0, str(_SRC))
 
 from fxwatch.db import session_scope, wait_for_db  # noqa: E402
 from fxwatch.models import (  # noqa: E402

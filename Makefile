@@ -18,9 +18,16 @@ ps:
 logs:
 	docker compose logs -f worker api
 
-# --no-deps: тестам и линтеру не нужны ни база, ни миграции - только образ.
+# --no-deps: юнит-тестам и линтеру не нужны ни база, ни миграции - только образ.
 test:
 	docker compose run --rm --no-deps --entrypoint pytest api -q
+
+# Полный набор вместе с интеграционными: они работают с настоящим Postgres
+# в отдельной базе fxwatch_test, рабочие данные не трогаются.
+test-db:
+	docker compose exec -T db psql -U fxwatch -d fxwatch -c "CREATE DATABASE fxwatch_test" || true
+	docker compose run --rm --entrypoint pytest \
+		-e FXWATCH_TEST_DSN=postgresql+psycopg://fxwatch:fxwatch@db:5432/fxwatch_test api -q
 
 lint:
 	docker compose run --rm --no-deps --entrypoint ruff api check src tests

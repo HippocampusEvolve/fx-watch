@@ -11,7 +11,16 @@
 5. проверить ответ целиком, затем каждое значение по отдельности;
 6. записать пригодные значения, непригодные - в карантин;
 7. сравнить с тем, что уже известно, и зафиксировать ревизии;
-8. закрыть прогон итоговым статусом.
+8. закрыть прогон итоговым статусом - тем же коммитом, что и данные.
+
+Пункт 8 стоит отдельного пояснения. Статус прогона пишется в той же транзакции,
+что и наблюдения, потому что «прогон ok, а данных нет» - это не просто
+неточность в журнале: такой день календарь посчитал бы нерабочим, а не дырой,
+и окно перезапроса никогда бы его не добрало. Либо в журнале есть и данные,
+и успешный статус, либо нет ни того, ни другого.
+
+По той же причине наружу ничего не отправляется из-под открытой транзакции:
+алерты копятся в :class:`~fxwatch.alerting.AlertOutbox` и уходят после коммита.
 
 Ошибка источника закрывает прогон статусом ``failed`` прямо здесь. Если же
 процесс убили или упала сама база, запись останется в ``running`` - такие
@@ -26,12 +35,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import text
+from sqlalchemy import literal_column, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from fxwatch import breaker
-from fxwatch.alerting import raise_alert, resolve_alert
+from fxwatch.alerting import AlertOutbox, raise_alert, resolve_alert
 from fxwatch.config import get_settings
 from fxwatch.db import session_scope
 from fxwatch.models import IngestRun, Observation, QualityCheck, Quarantine, RawPayload, Revision
@@ -41,6 +50,9 @@ from fxwatch.sources import get_source
 from fxwatch.sources.base import DataPoint, FetchResult, SourceError
 
 log = logging.getLogger(__name__)
+
+#: Статусы, при которых считаем, что источник отработал штатно.
+SUCCESS_STATUSES = frozenset({"ok", "partial"})
 
 
 @dataclass(slots=True)
@@ -76,17 +88,21 @@ def _open_run(source_code: str, target_date: date | None, job: str) -> int:
         return run.id
 
 
-def _close_run(run_id: int, **fields: object) -> None:
-    with session_scope() as session:
-        run = session.get(IngestRun, run_id)
-        if run is None:
-            return
-        for key, value in fields.items():
-            setattr(run, key, value)
-        if run.finished_at is None:
-            run.finished_at = datetime.now(UTC)
-        if run.started_at and run.finished_at and run.duration_ms is None:
-            run.duration_ms = int((run.finished_at - run.started_at).total_seconds() * 1000)
+def _close_run_in(session: Session, run_id: int, **fields: object) -> None:
+    """Проставить итог прогона в уже открытой транзакции.
+
+    Именно так закрывается прогон, записавший данные: статус и данные должны
+    попасть в базу одним коммитом.
+    """
+    run = session.get(IngestRun, run_id)
+    if run is None:
+        return
+    for key, value in fields.items():
+        setattr(run, key, value)
+    if run.finished_at is None:
+        run.finished_at = datetime.now(UTC)
+    if run.started_at and run.finished_at and run.duration_ms is None:
+        run.duration_ms = int((run.finished_at - run.started_at).total_seconds() * 1000)
 
 
 def reap_stale_runs(max_age_minutes: int = 60) -> int:
@@ -119,14 +135,19 @@ def reap_stale_runs(max_age_minutes: int = 60) -> int:
 # --------------------------------------------------------------------------
 
 def _current_values(session: Session, source_code: str, value_date: date) -> dict[str, tuple[Decimal, datetime]]:
-    """Последние известные значения за дату: основа детекции ревизий."""
+    """Последние подтверждённые значения за дату: основа детекции ревизий.
+
+    Ранжирование по ``last_seen_at``, а не по ``observed_at``: текущая версия -
+    та, которую источник подтверждал последней, иначе возврат к ранее отданному
+    значению остался бы незамеченным.
+    """
     rows = session.execute(
         text(
             """
-            SELECT DISTINCT ON (series_key) series_key, value_num, observed_at
+            SELECT DISTINCT ON (series_key) series_key, value_num, last_seen_at
             FROM observations
             WHERE source_code = :src AND value_date = :day
-            ORDER BY series_key, observed_at DESC, id DESC
+            ORDER BY series_key, last_seen_at DESC, id DESC
             """
         ),
         {"src": source_code, "day": value_date},
@@ -142,7 +163,7 @@ def _previous_values(session: Session, source_code: str, before: date) -> dict[s
             SELECT DISTINCT ON (series_key) series_key, value_num
             FROM observations
             WHERE source_code = :src AND value_date < :day
-            ORDER BY series_key, value_date DESC, observed_at DESC
+            ORDER BY series_key, value_date DESC, last_seen_at DESC
             """
         ),
         {"src": source_code, "day": before},
@@ -163,6 +184,67 @@ def _first_observed_at(session: Session, source_code: str, series_key: str, valu
     return stamp or datetime.now(UTC)
 
 
+def _quarantine(
+    session: Session,
+    *,
+    run_id: int,
+    source_code: str,
+    reason: str,
+    check_name: str,
+    series_key: str | None = None,
+    value_date: date | None = None,
+    raw_value: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Положить запись в карантин, склеивая повторы одной и той же проблемы.
+
+    Окно перезапроса каждую ночь трогает те же две недели. Без склейки одно
+    стабильно битое значение давало бы четырнадцать новых записей в сутки,
+    и по числу строк в карантине нельзя было бы понять, сколько проблем
+    на самом деле.
+    """
+    now = now or datetime.now(UTC)
+    existing = session.execute(
+        text(
+            """
+            SELECT id FROM quarantine
+            WHERE source_code = :src
+              AND series_key IS NOT DISTINCT FROM :series
+              AND value_date IS NOT DISTINCT FROM :day
+              AND check_name IS NOT DISTINCT FROM :check
+              AND resolved_at IS NULL
+            ORDER BY id DESC LIMIT 1
+            """
+        ),
+        {"src": source_code, "series": series_key, "day": value_date, "check": check_name},
+    ).scalar()
+
+    if existing is not None:
+        session.execute(
+            text(
+                """
+                UPDATE quarantine
+                SET seen_count = seen_count + 1, last_seen_at = :now,
+                    run_id = :run_id, reason = :reason, raw_value = :raw_value
+                WHERE id = :id
+                """
+            ),
+            {
+                "now": now, "run_id": run_id, "reason": reason,
+                "raw_value": raw_value, "id": existing,
+            },
+        )
+        return
+
+    session.add(
+        Quarantine(
+            run_id=run_id, source_code=source_code, series_key=series_key,
+            value_date=value_date, raw_value=raw_value, reason=reason,
+            check_name=check_name, quarantined_at=now, last_seen_at=now, seen_count=1,
+        )
+    )
+
+
 # --------------------------------------------------------------------------
 # Основной проход
 # --------------------------------------------------------------------------
@@ -172,12 +254,14 @@ def ingest_date(source_code: str, target_date: date, job: str = "poll") -> RunOu
     settings = get_settings()
     source = get_source(source_code)
     run_id = _open_run(source_code, target_date, job)
+    outbox = AlertOutbox()
 
     # --- предохранитель ---------------------------------------------------
     with session_scope() as session:
         if breaker.is_open(session, source_code):
             until = breaker.opened_until(session, source_code)
-            _close_run(
+            _close_run_in(
+                session,
                 run_id,
                 status="skipped",
                 error_class="CircuitOpen",
@@ -200,28 +284,44 @@ def ingest_date(source_code: str, target_date: date, job: str = "poll") -> RunOu
                     severity=rules.ERROR,
                     title=f"Источник {source_code} недоступен",
                     body=f"{settings.breaker_failure_threshold} неудач подряд. Последняя ошибка: {message}",
+                    outbox=outbox,
                 )
-        _close_run(run_id, status="failed", error_class=type(exc).__name__, error_message=message)
+            _close_run_in(
+                session, run_id, status="failed",
+                error_class=type(exc).__name__, error_message=message,
+            )
+        outbox.flush()
         return RunOutcome(run_id, source_code, target_date, "failed", error=message)
 
-    outcome = _persist(run_id, source_code, target_date, result, source.min_expected_series)
+    outcome = _persist(run_id, source_code, target_date, result, source.min_expected_series, outbox)
+    outbox.flush()
 
     with session_scope() as session:
-        breaker.record_success(session, source_code)
-        resolve_alert(session, f"source_down:{source_code}")
+        if outcome.status in SUCCESS_STATUSES:
+            breaker.record_success(session, source_code)
+            resolve_alert(session, f"source_down:{source_code}")
+        # Ответ, не прошедший ворота качества, состояние предохранителя не трогает:
+        # сеть жива, поэтому это не неудача источника, но и успехом считать нечего -
+        # иначе источник, стабильно отдающий мусор, вечно выглядел бы здоровым.
 
     return outcome
 
 
 def _persist(
-    run_id: int, source_code: str, target_date: date, result: FetchResult, min_expected_series: int
+    run_id: int,
+    source_code: str,
+    target_date: date,
+    result: FetchResult,
+    min_expected_series: int,
+    outbox: AlertOutbox,
 ) -> RunOutcome:
-    """Проверить и записать полученные данные."""
+    """Проверить и записать полученные данные одной транзакцией."""
     settings = get_settings()
     checks: list[CheckResult] = []
     inserted = revised = quarantined = 0
 
     with session_scope() as session:
+        now = datetime.now(UTC)
         session.add(
             RawPayload(
                 run_id=run_id,
@@ -241,11 +341,10 @@ def _persist(
         if blocking:
             reason = "; ".join(c.message or c.check_name for c in blocking)
             for c in blocking:
-                session.add(
-                    Quarantine(
-                        run_id=run_id, source_code=source_code, value_date=target_date,
-                        raw_value=f"{len(result.raw_body)} байт", reason=reason, check_name=c.check_name,
-                    )
+                _quarantine(
+                    session, run_id=run_id, source_code=source_code, value_date=target_date,
+                    raw_value=f"{len(result.raw_body)} байт", reason=reason,
+                    check_name=c.check_name, now=now,
                 )
             _record_checks(session, run_id, source_code, checks)
             raise_alert(
@@ -254,9 +353,10 @@ def _persist(
                 severity=rules.ERROR,
                 title=f"Некорректный ответ источника {source_code}",
                 body=reason,
+                outbox=outbox,
             )
-            _close_run(
-                run_id, status="failed", http_status=result.http_status,
+            _close_run_in(
+                session, run_id, status="failed", http_status=result.http_status,
                 attempt_count=result.attempts, raw_sha256=result.raw_sha256,
                 rows_fetched=len(result.points), rows_quarantined=len(blocking),
                 error_class="QualityGate", error_message=reason,
@@ -269,12 +369,10 @@ def _persist(
 
         # Точки, не разобранные парсером, тоже фиксируем - они не должны исчезнуть.
         for label, reason in result.quarantine:
-            session.add(
-                Quarantine(
-                    run_id=run_id, source_code=source_code, series_key=label[:32],
-                    value_date=result.reported_date or target_date,
-                    reason=reason, check_name="parse",
-                )
+            _quarantine(
+                session, run_id=run_id, source_code=source_code, series_key=label[:32],
+                value_date=result.reported_date or target_date,
+                reason=reason, check_name="parse", now=now,
             )
             quarantined += 1
 
@@ -290,12 +388,10 @@ def _persist(
             failed = [c for c in point_checks if c.is_blocking]
             if failed:
                 reason = "; ".join(c.message or c.check_name for c in failed)
-                session.add(
-                    Quarantine(
-                        run_id=run_id, source_code=source_code, series_key=point.series_key,
-                        value_date=point.value_date, raw_value=point.raw_value,
-                        reason=reason, check_name=failed[0].check_name,
-                    )
+                _quarantine(
+                    session, run_id=run_id, source_code=source_code, series_key=point.series_key,
+                    value_date=point.value_date, raw_value=point.raw_value,
+                    reason=reason, check_name=failed[0].check_name, now=now,
                 )
                 quarantined += 1
                 raise_alert(
@@ -304,12 +400,12 @@ def _persist(
                     severity=rules.ERROR,
                     title=f"Отклонено значение {point.series_key} за {point.value_date.isoformat()}",
                     body=reason,
+                    outbox=outbox,
                 )
                 continue
             accepted.append(point)
 
         # --- запись наблюдений -------------------------------------------
-        now = datetime.now(UTC)
         for point in accepted:
             stmt = (
                 pg_insert(Observation)
@@ -320,24 +416,34 @@ def _persist(
                     value_num=point.value,
                     nominal=point.nominal,
                     observed_at=now,
+                    last_seen_at=now,
                     run_id=run_id,
                     payload_hash=point.payload_hash(),
                 )
                 # Тот же хэш означает, что источник повторил уже известное значение:
-                # молча пропускаем. Повторный запуск за ту же дату безопасен.
-                .on_conflict_do_nothing(constraint="uq_observation_value")
-                .returning(Observation.id)
+                # новой версии не создаём, но отмечаем факт подтверждения. Это и есть
+                # идемпотентность сбора, и одновременно - способ увидеть откат
+                # источника к значению, которое он уже отдавал раньше.
+                .on_conflict_do_update(
+                    constraint="uq_observation_value",
+                    set_={"last_seen_at": now},
+                )
+                # xmax = 0 у строки, которая действительно вставлена, а не обновлена.
+                .returning(Observation.id, literal_column("(xmax = 0)").label("is_new"))
             )
-            new_id = session.execute(stmt).scalar()
-            if new_id is None:
-                continue
-            inserted += 1
+            row = session.execute(stmt).one()
+            is_new_version = bool(row.is_new)
+            if is_new_version:
+                inserted += 1
 
             known = current.get(point.series_key)
             if known is None or known[0] == point.value:
+                # Первое значение за дату либо подтверждение текущего - не ревизия.
                 continue
 
             # Значение за уже собранную дату изменилось - это ревизия источника.
+            # Ветка is_new_version=False означает возврат к ранее отданному значению:
+            # строки не прибавилось, но текущая версия сменилась, и это событие.
             old_value = known[0]
             delta_pct = (
                 abs((point.value - old_value) / old_value * Decimal(100)) if old_value else Decimal(0)
@@ -354,9 +460,11 @@ def _persist(
                     first_observed_at=_first_observed_at(session, source_code, point.series_key, point.value_date),
                     revised_at=now, run_id=run_id,
                     is_significant=is_significant, is_late=is_late,
+                    is_rollback=not is_new_version,
                 )
             )
             revised += 1
+            current[point.series_key] = (point.value, now)
 
             if is_significant and is_late:
                 raise_alert(
@@ -368,14 +476,28 @@ def _persist(
                         f"{old_value} заменено на {point.value} (расхождение {delta_pct:.2f}%). "
                         f"Дата вышла из окна перезапроса в {settings.sweep_days} дней."
                     ),
+                    outbox=outbox,
+                )
+            if not is_new_version and is_significant:
+                raise_alert(
+                    session,
+                    key=f"rollback:{source_code}:{point.series_key}:{point.value_date.isoformat()}",
+                    severity=rules.WARN,
+                    title=f"Источник вернул прежнее значение {point.series_key} за {point.value_date.isoformat()}",
+                    body=(
+                        f"Текущим считалось {old_value}, источник снова отдаёт {point.value}. "
+                        "Значение уже встречалось в истории этой даты."
+                    ),
+                    outbox=outbox,
                 )
 
         _record_checks(session, run_id, source_code, checks)
 
         status = "partial" if quarantined else "ok"
-        _close_run(
-            run_id, status=status, http_status=result.http_status, attempt_count=result.attempts,
-            raw_sha256=result.raw_sha256, rows_fetched=len(result.points), rows_inserted=inserted,
+        _close_run_in(
+            session, run_id, status=status, http_status=result.http_status,
+            attempt_count=result.attempts, raw_sha256=result.raw_sha256,
+            rows_fetched=len(result.points), rows_inserted=inserted,
             rows_revised=revised, rows_quarantined=quarantined,
         )
 
@@ -393,7 +515,7 @@ RESPONSE_LEVEL_CHECKS = frozenset({"response_payload", "completeness", "reported
 def _record_checks(session: Session, run_id: int, source_code: str, checks: list[CheckResult]) -> None:
     """Сохранить результаты проверок.
 
-    Проверки уровня значения выполняются по сорок с лишним раз за прогон, поэтому
+    Проверки уровня значения выполняются по полсотни раз за прогон, поэтому
     писать каждый успех отдельной строкой значило бы за три месяца накопить
     миллионы записей «всё хорошо». Но и молчать о них нельзя: без успехов
     в отчёте видны только провалы, и проверка выглядит вечно не пройденной.

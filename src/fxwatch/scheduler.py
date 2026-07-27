@@ -56,18 +56,32 @@ def _poll_primary() -> None:
     распознаёт по собственному календарю источника и не дёргает его впустую.
     Пропуск в журнал не пишется: десяток строк «сходил зря» в день засорял бы
     журнал, ради чистоты которого всё и построено (в лог строка попадает).
+
+    Отметка живости ставится в любом исходе, включая ранний выход. Живость
+    здесь - это «логика окна отработала», а не «был сетевой запрос»: в штатном
+    дне запроса не будет никогда, и отметка по факту запроса протухала бы ровно
+    тогда, когда всё в порядке.
     """
     settings = get_settings()
     today = datetime.now(settings.zone).date()
+    need_poll = True
+
     with session_scope() as session:
         kind = classify_days(session, today, today, PRIMARY_SOURCE)[today]
         if kind == DayKind.BUSINESS:
             log.info("курс за %s уже получен, страховочный опрос не нужен", today)
-            return
-        if kind == DayKind.NON_BUSINESS and not weekday_has_history(session, today, PRIMARY_SOURCE):
+            need_poll = False
+        elif kind == DayKind.NON_BUSINESS and not weekday_has_history(session, today, PRIMARY_SOURCE):
             log.info("на %s источник курс не публикует, опрос пропущен", today)
-            return
-    jobs.job_poll(PRIMARY_SOURCE)
+            need_poll = False
+
+    if need_poll:
+        jobs.job_poll(PRIMARY_SOURCE)
+
+    # Интервал с запасом на выходные: окно 11-15:30 работает по будням,
+    # но вечерний контрольный проход - ежедневный, поэтому 30 часов.
+    jobs.touch_heartbeat(f"poll_window:{PRIMARY_SOURCE}", 30 * 3600)
+    jobs.ping_watchdog(f"poll_window:{PRIMARY_SOURCE}")
 
 
 def _poll_secondary() -> None:

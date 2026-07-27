@@ -166,9 +166,17 @@ def get_series(
 ) -> dict[str, Any]:
     """Ряд значений за период.
 
-    Без ``as_of`` отдаётся текущее знание: последняя версия каждого значения.
-    С ``as_of`` - состояние на указанный момент, то есть наблюдения, полученные
-    позже, игнорируются. Разница между этими двумя выборками и есть ревизии.
+    Без ``as_of`` отдаётся текущее знание: версия, которую источник подтверждал
+    последней. С ``as_of`` - состояние на указанный момент, то есть наблюдения,
+    полученные позже, игнорируются. Разница между этими двумя выборками и есть
+    ревизии.
+
+    Ранжирование в двух режимах разное, и это намеренно. Текущее состояние
+    считается по ``last_seen_at``: если источник вернулся к значению, которое
+    уже отдавал, текущим должно стать оно, а не то, что мы увидели позже.
+    Реконструкция прошлого считается по ``observed_at``: на тот момент сервис
+    знал ровно то, что успел получить, а более поздние подтверждения к его
+    тогдашнему знанию отношения не имеют.
     """
     end = _today()
     start = end - timedelta(days=days)
@@ -181,7 +189,9 @@ def get_series(
             WHERE source_code = :src AND series_key = :series
               AND value_date BETWEEN :start AND :end
               AND (CAST(:as_of AS timestamptz) IS NULL OR observed_at <= CAST(:as_of AS timestamptz))
-            ORDER BY value_date, observed_at DESC, id DESC
+            ORDER BY value_date,
+                     CASE WHEN CAST(:as_of AS timestamptz) IS NULL THEN last_seen_at ELSE observed_at END DESC,
+                     id DESC
             """
         ),
         {"src": source, "series": code, "start": start, "end": end, "as_of": as_of},
@@ -223,11 +233,16 @@ def get_point_history(
     source: str = Query(PRIMARY_SOURCE),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """Все версии одного значения: что и когда сервис знал об этой дате."""
+    """Все версии одного значения: что и когда сервис знал об этой дате.
+
+    ``last_seen_at`` показывает, когда источник подтверждал версию в последний
+    раз. По нему видно и возврат к прежнему значению: у старой версии время
+    подтверждения окажется свежее, чем у той, что появилась после неё.
+    """
     rows = session.execute(
         text(
             """
-            SELECT value_num, observed_at, run_id, payload_hash
+            SELECT value_num, observed_at, last_seen_at, run_id, payload_hash
             FROM observations
             WHERE source_code = :src AND series_key = :series AND value_date = :day
             ORDER BY observed_at
@@ -235,13 +250,15 @@ def get_point_history(
         ),
         {"src": source, "series": code, "day": day},
     ).all()
+    current_hash = max(rows, key=lambda r: r[2])[4] if rows else None
     return {
         "series_key": code,
         "value_date": day.isoformat(),
         "versions": [
             {
                 "value": float(r[0]), "observed_at": r[1].isoformat(),
-                "run_id": r[2], "payload_hash": r[3][:12],
+                "last_seen_at": r[2].isoformat(), "run_id": r[3],
+                "payload_hash": r[4][:12], "is_current": r[4] == current_hash,
             }
             for r in rows
         ],
@@ -384,8 +401,8 @@ def get_quarantine(
         text(
             """
             SELECT id, run_id, source_code, series_key, value_date, raw_value,
-                   reason, check_name, quarantined_at, resolved_at
-            FROM quarantine ORDER BY quarantined_at DESC LIMIT :limit
+                   reason, check_name, quarantined_at, resolved_at, last_seen_at, seen_count
+            FROM quarantine ORDER BY last_seen_at DESC LIMIT :limit
             """
         ),
         {"limit": limit},
@@ -397,6 +414,7 @@ def get_quarantine(
                 "value_date": r[4].isoformat() if r[4] else None, "raw_value": r[5],
                 "reason": r[6], "check_name": r[7], "quarantined_at": r[8].isoformat(),
                 "resolved_at": r[9].isoformat() if r[9] else None,
+                "last_seen_at": r[10].isoformat(), "seen_count": r[11],
             }
             for r in rows
         ]

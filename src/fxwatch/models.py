@@ -2,16 +2,22 @@
 
 Ядро решения - таблица ``observations``. Она append-only и битемпоральная:
 
-* ``value_date``  - к какой дате относится значение (valid time);
-* ``observed_at`` - когда мы это значение увидели (transaction time).
+* ``value_date``   - к какой дате относится значение (valid time);
+* ``observed_at``  - когда мы это значение увидели впервые (transaction time);
+* ``last_seen_at`` - когда источник в последний раз подтвердил это значение.
 
 Уникальный ключ ``(source_code, series_key, value_date, payload_hash)`` делает
 всю работу по требованиям 2 и 4 ТЗ:
 
-* повторный запрос с тем же значением даёт тот же хэш и отбрасывается
-  через ``ON CONFLICT DO NOTHING`` - сбор идемпотентен;
+* повторный запрос с тем же значением даёт тот же хэш, новой строки не создаёт -
+  сбор идемпотентен, обновляется только ``last_seen_at``;
 * повторный запрос с другим значением даёт другой хэш и ложится новой строкой -
   ревизия источника сохраняется, ничего не перезаписывается.
+
+Две отметки времени вместо одной нужны из-за отката: если источник отдал A,
+потом B, потом снова A, то строка A уже существует, и без ``last_seen_at``
+витрина навсегда осталась бы на B. Текущей версией считается та, что источник
+подтверждал последней, а не та, которую мы увидели последней.
 
 Текущее состояние и «состояние на дату X» - это две выборки из одной и той же
 таблицы, а не два разных хранилища.
@@ -57,6 +63,12 @@ class Observation(Base):
     observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # Последнее подтверждение значения источником. Отличается от observed_at
+    # только у значений, которые источник отдавал повторно, - и именно по нему
+    # определяется текущая версия, иначе откат A -> B -> A остался бы незамеченным.
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
 
@@ -66,6 +78,7 @@ class Observation(Base):
         ),
         Index("ix_obs_series_date", "source_code", "series_key", "value_date"),
         Index("ix_obs_observed_at", "observed_at"),
+        Index("ix_obs_last_seen_at", "last_seen_at"),
     )
 
 
@@ -125,6 +138,9 @@ class Revision(Base):
     is_significant: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # Ревизия периода, который уже вышел из окна перезапроса, - отдельный сигнал.
     is_late: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Источник вернулся к значению, которое уже отдавал раньше. Новой строки
+    # наблюдения при этом не появляется, поэтому событие фиксируется явно.
+    is_rollback: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     __table_args__ = (Index("ix_rev_date", "value_date"), Index("ix_rev_revised_at", "revised_at"))
 
@@ -173,7 +189,13 @@ class QualityCheck(Base):
 
 
 class Quarantine(Base):
-    """Запись, не прошедшая валидацию. Не попадает в витрину, но и не теряется."""
+    """Запись, не прошедшая валидацию. Не попадает в витрину, но и не теряется.
+
+    Одна строка на одну проблему, а не на одну попытку: окно перезапроса
+    трогает те же даты каждую ночь, и без склейки стабильно битое значение
+    давало бы четырнадцать новых записей в сутки. Повторное срабатывание
+    увеличивает ``seen_count`` и двигает ``last_seen_at``.
+    """
 
     __tablename__ = "quarantine"
 
@@ -188,10 +210,17 @@ class Quarantine(Base):
     quarantined_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    seen_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolution: Mapped[str | None] = mapped_column(Text)
 
-    __table_args__ = (Index("ix_quarantine_time", "quarantined_at"),)
+    __table_args__ = (
+        Index("ix_quarantine_time", "quarantined_at"),
+        Index("ix_quarantine_slot", "source_code", "series_key", "value_date", "check_name"),
+    )
 
 
 class Alert(Base):

@@ -16,8 +16,8 @@
 * ``error`` - запись уходит в карантин и в витрину не попадает, поднимается алерт.
 
 Провал по одной валюте не отменяет остальные: прогон получает статус ``partial``,
-43 корректных курса сохраняются. Полный откат здесь означал бы терять данные
-из-за одной сломанной строки, а требование ТЗ прямо обратное.
+остальные полсотни курсов сохраняются. Полный откат здесь означал бы терять
+данные из-за одной сломанной строки, а требование ТЗ прямо обратное.
 """
 
 from __future__ import annotations
@@ -32,9 +32,15 @@ from sqlalchemy.orm import Session
 from fxwatch.calendar import DayKind, classify_days
 from fxwatch.config import get_settings
 from fxwatch.sources.base import DataPoint, FetchResult
+from fxwatch.sources.erapi import TRACKED as _SECONDARY_TRACKED
 
 INFO, WARN, ERROR = "info", "warn", "error"
 PASS, FAIL, SKIP = "pass", "fail", "skip"
+
+#: Ряды, по которым сверка вообще возможна: столько отдаёт второй источник.
+#: Список выводится из него самого, чтобы он не разъехался с реальностью,
+#: если состав отслеживаемых валют изменится.
+CROSS_CHECKED_SERIES = tuple(f"{code}/RUB" for code in _SECONDARY_TRACKED)
 
 
 @dataclass(slots=True)
@@ -261,7 +267,26 @@ def check_freshness(session: Session, source_code: str, now: datetime | None = N
     )
 
 
-def check_stale_series(session: Session, source_code: str, series_key: str, today: date) -> CheckResult:
+def stale_window(session: Session, source_code: str, today: date) -> list[date]:
+    """Рабочие дни, по которым считается застой.
+
+    Вынесено из :func:`check_stale_series`, потому что проверка идёт по всем
+    рядам источника, а календарь для них общий: считать его полсотни раз
+    за прогон значило бы полсотни одинаковых запросов.
+    """
+    settings = get_settings()
+    window_start = today - timedelta(days=settings.stale_business_days * 3 + 7)
+    kinds = classify_days(session, window_start, today, source_code)
+    return sorted(day for day, kind in kinds.items() if kind == DayKind.BUSINESS)
+
+
+def check_stale_series(
+    session: Session,
+    source_code: str,
+    series_key: str,
+    today: date,
+    business_days: list[date] | None = None,
+) -> CheckResult:
     """Значение перестало меняться.
 
     Считаем только по рабочим дням календаря: в выходные курс ЦБ не меняется
@@ -270,9 +295,7 @@ def check_stale_series(session: Session, source_code: str, series_key: str, toda
     берётся из константы.
     """
     settings = get_settings()
-    window_start = today - timedelta(days=settings.stale_business_days * 3 + 7)
-    kinds = classify_days(session, window_start, today, source_code)
-    business = sorted(day for day, kind in kinds.items() if kind == DayKind.BUSINESS)
+    business = business_days if business_days is not None else stale_window(session, source_code, today)
 
     if len(business) < settings.stale_business_days:
         return CheckResult(
@@ -308,6 +331,30 @@ def check_stale_series(session: Session, source_code: str, series_key: str, toda
             observed=str(rows[0][1]), expected="значение должно меняться",
         )
     return CheckResult("stale_series", WARN, PASS, series_key=series_key, value_date=recent[-1])
+
+
+def latest_comparable_date(session: Session, series_key: str, since: date) -> date | None:
+    """Последняя дата, за которую есть значения обоих источников.
+
+    Сверять «за сегодня» нельзя: ЦБ не устанавливает курс на воскресенье
+    и понедельник, и в эти дни сверка гарантированно пропускалась бы, хотя
+    сравнить есть что - за пятницу или субботу данные обоих источников уже
+    лежат в базе. Поэтому проверка идёт по последней дате, где сравнение
+    вообще возможно, а не по календарному «сегодня».
+    """
+    return session.execute(
+        text(
+            """
+            SELECT value_date FROM observations
+            WHERE series_key = :series AND value_date >= :since
+            GROUP BY value_date
+            HAVING count(DISTINCT source_code) >= 2
+            ORDER BY value_date DESC
+            LIMIT 1
+            """
+        ),
+        {"series": series_key, "since": since},
+    ).scalar()
 
 
 def check_cross_source(session: Session, series_key: str, value_date: date) -> CheckResult:

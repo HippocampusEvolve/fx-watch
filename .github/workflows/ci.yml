@@ -8,6 +8,29 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # Интеграционные тесты работают с настоящим Postgres: идемпотентность,
+    # ревизии, откат значения и порядок версий во вьюхе держатся на уникальном
+    # индексе и ON CONFLICT, а не на коде на Python, - на заглушках эти
+    # утверждения проверить нельзя.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: fxwatch
+          POSTGRES_PASSWORD: fxwatch
+          POSTGRES_DB: fxwatch_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fxwatch -d fxwatch_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      FXWATCH_TEST_DSN: postgresql+psycopg://fxwatch:fxwatch@localhost:5432/fxwatch_test
+
     steps:
       - uses: actions/checkout@v4
 
@@ -23,8 +46,9 @@ jobs:
         run: ruff check src tests
 
       - name: Тесты
-        # Тесты не требуют базы и сети: ответы источников подменяются
-        # фикстурами и respx, поэтому CI не зависит от доступности ЦБ.
+        # Ответы источников подменяются фикстурами и respx, поэтому от
+        # доступности ЦБ прогон не зависит; база нужна только тестам,
+        # помеченным как integration.
         run: pytest -q
 
   build:
@@ -51,3 +75,12 @@ jobs:
           docker run --rm --network fxnet \
             -e FXWATCH_DB_DSN=postgresql+psycopg://fxwatch:fxwatch@fxdb:5432/fxwatch \
             fx-watch:ci migrate
+
+      - name: Схема совпадает с моделями
+        # Начальная миграция описывает таблицы явно, поэтому расхождение между
+        # models.py и migrations/ возможно - и ловится здесь, а не на проде
+        # через полгода.
+        run: |
+          docker run --rm --network fxnet \
+            -e FXWATCH_DB_DSN=postgresql+psycopg://fxwatch:fxwatch@fxdb:5432/fxwatch \
+            --entrypoint alembic fx-watch:ci check

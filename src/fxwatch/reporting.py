@@ -114,7 +114,8 @@ def summarize_runs(session: Session, start: date, end: date) -> dict[str, Any]:
         text(
             """
             SELECT source_code, status, count(*) AS cnt,
-                   avg(duration_ms)::int AS avg_ms,
+                   sum(duration_ms) AS sum_ms,
+                   count(duration_ms) AS timed,
                    max(duration_ms) AS max_ms,
                    sum(attempt_count) AS attempts
             FROM ingest_runs
@@ -128,15 +129,28 @@ def summarize_runs(session: Session, start: date, end: date) -> dict[str, Any]:
 
     by_source: dict[str, dict[str, Any]] = {}
     totals = {"ok": 0, "partial": 0, "failed": 0, "skipped": 0, "running": 0}
-    for source_code, status, cnt, avg_ms, max_ms, attempts in rows:
+    for source_code, status, cnt, sum_ms, timed, max_ms, attempts in rows:
         entry = by_source.setdefault(
-            source_code, {"ok": 0, "partial": 0, "failed": 0, "skipped": 0, "running": 0, "avg_ms": 0, "max_ms": 0}
+            source_code,
+            {
+                "ok": 0, "partial": 0, "failed": 0, "skipped": 0, "running": 0,
+                "avg_ms": 0, "max_ms": 0, "_sum_ms": 0, "_timed": 0,
+            },
         )
         entry[status] = cnt
-        entry["avg_ms"] = max(entry["avg_ms"], avg_ms or 0)
+        # Среднее считается по всем прогонам источника разом. Брать максимум
+        # из средних по статусам, как было раньше, значило показывать не среднее,
+        # а длительность самой медленной группы.
+        entry["_sum_ms"] += int(sum_ms or 0)
+        entry["_timed"] += int(timed or 0)
+        entry["avg_ms"] = round(entry["_sum_ms"] / entry["_timed"]) if entry["_timed"] else 0
         entry["max_ms"] = max(entry["max_ms"], max_ms or 0)
         entry["retries"] = entry.get("retries", 0) + int(attempts or 0)
         totals[status] = totals.get(status, 0) + cnt
+
+    for entry in by_source.values():
+        entry.pop("_sum_ms", None)
+        entry.pop("_timed", None)
 
     total = sum(totals.values())
     success = totals["ok"] + totals["partial"]
@@ -240,6 +254,7 @@ def summarize_revisions(session: Session, start: date, end: date) -> dict[str, A
             SELECT count(*) AS total,
                    count(*) FILTER (WHERE is_significant) AS significant,
                    count(*) FILTER (WHERE is_late) AS late,
+                   count(*) FILTER (WHERE is_rollback) AS rollbacks,
                    coalesce(max(delta_pct), 0) AS max_delta
             FROM revisions
             WHERE revised_at >= :start AND revised_at < :end
@@ -265,6 +280,7 @@ def summarize_revisions(session: Session, start: date, end: date) -> dict[str, A
         "total": row.total,
         "significant": row.significant,
         "late": row.late,
+        "rollbacks": row.rollbacks,
         "max_delta_pct": float(row.max_delta or Decimal(0)),
         "top": [
             {
@@ -281,17 +297,28 @@ def summarize_quality(session: Session, start: date, end: date) -> dict[str, Any
     checks = session.execute(
         text(
             """
-            SELECT check_name, status, count(*) FROM quality_checks
+            SELECT check_name, status, severity, count(*) FROM quality_checks
             WHERE checked_at >= :start AND checked_at < :end
-            GROUP BY check_name, status ORDER BY check_name
+            GROUP BY check_name, status, severity ORDER BY check_name
             """
         ),
         {"start": start, "end": end + timedelta(days=1)},
     ).all()
 
     by_check: dict[str, dict[str, int]] = {}
-    for check_name, status, count in checks:
-        by_check.setdefault(check_name, {})[status] = count
+    # Провалы разной серьёзности требуют разного: скачок курса на 12% принимается
+    # с предупреждением, а неположительное значение отправляется в карантин.
+    # Вердикт отчёта смотрит именно на эту разницу, поэтому она считается отдельно.
+    failed_blocking = 0
+    failed_warning = 0
+    for check_name, status, severity, count in checks:
+        slot = by_check.setdefault(check_name, {})
+        slot[status] = slot.get(status, 0) + count
+        if status == "fail":
+            if severity == "error":
+                failed_blocking += count
+            else:
+                failed_warning += count
 
     quarantine = session.execute(
         text(
@@ -306,9 +333,26 @@ def summarize_quality(session: Session, start: date, end: date) -> dict[str, Any
     alerts = session.execute(
         text(
             """
-            SELECT severity, count(*), sum(fire_count) FROM alerts
+            SELECT severity,
+                   count(*) AS unique_keys,
+                   sum(fire_count) AS fired,
+                   count(*) FILTER (WHERE resolved_at IS NULL) AS still_open
+            FROM alerts
             WHERE last_fired_at >= :start AND last_fired_at < :end
             GROUP BY severity
+            """
+        ),
+        {"start": start, "end": end + timedelta(days=1)},
+    ).all()
+
+    open_alerts = session.execute(
+        text(
+            """
+            SELECT alert_key, severity, title, last_fired_at, fire_count
+            FROM alerts
+            WHERE resolved_at IS NULL AND last_fired_at >= :start AND last_fired_at < :end
+            ORDER BY severity, last_fired_at DESC
+            LIMIT 20
             """
         ),
         {"start": start, "end": end + timedelta(days=1)},
@@ -317,8 +361,20 @@ def summarize_quality(session: Session, start: date, end: date) -> dict[str, Any
     return {
         "by_check": by_check,
         "failed_total": sum(v.get("fail", 0) for v in by_check.values()),
+        "failed_blocking": failed_blocking,
+        "failed_warning": failed_warning,
         "quarantine": {"total": quarantine.total, "open": quarantine.open},
-        "alerts": [{"severity": a[0], "unique": a[1], "fired": int(a[2] or 0)} for a in alerts],
+        "alerts": [
+            {"severity": a[0], "unique": a[1], "fired": int(a[2] or 0), "open": a[3]} for a in alerts
+        ],
+        "alerts_open": sum(a[3] for a in alerts),
+        "open_alerts": [
+            {
+                "key": a[0], "severity": a[1], "title": a[2],
+                "last_fired_at": a[3].isoformat(), "fire_count": a[4],
+            }
+            for a in open_alerts
+        ],
     }
 
 
@@ -381,14 +437,29 @@ def build_report(session: Session, start: date, end: date) -> PeriodReport:
 
 
 def _verdict(report: PeriodReport) -> str:
-    """Одна строка, ради которой отчёт и открывают."""
+    """Одна строка, ради которой отчёт и открывают.
+
+    Она обязана смотреть на весь отчёт, а не на его часть. Вердикт
+    «вмешательство не требуется» при непройденных проверках и открытых алертах
+    в том же документе - худший вид мониторинга: он не просто бесполезен,
+    он отговаривает читать остальное.
+
+    Поэтому градаций три:
+
+    * что-то сломано и не починилось само - «требует внимания»;
+    * данные полные, но есть замечания уровня предупреждения (например, скачок
+      курса на 12% - это рынок, а не сбой) - говорим и о том, и о другом;
+    * чисто везде - только тогда «вмешательство не требуется».
+    """
     coverage = report.coverage.get("coverage_pct", 0)
     gaps = len(report.coverage.get("gap_days", []))
     unresolved = [i for i in report.incidents if not i.recovered]
-    open_quarantine = report.quality.get("quarantine", {}).get("open", 0)
+    quality = report.quality
+    open_quarantine = quality.get("quarantine", {}).get("open", 0)
+    open_alerts = quality.get("alerts_open", 0)
+    failed_blocking = quality.get("failed_blocking", 0)
+    failed_warning = quality.get("failed_warning", 0)
 
-    if coverage >= 100 and not gaps and not unresolved and not open_quarantine:
-        return "Данные полные, все сбои восстановились автоматически, вмешательство не требуется"
     problems = []
     if gaps:
         problems.append(f"дней без данных: {gaps}")
@@ -397,8 +468,21 @@ def _verdict(report: PeriodReport) -> str:
     if unresolved:
         problems.append(f"незавершённых инцидентов: {len(unresolved)}")
     if open_quarantine:
-        problems.append(f"записей в карантине: {open_quarantine}")
-    return "Требует внимания: " + ", ".join(problems)
+        problems.append(f"записей в карантине не разобрано: {open_quarantine}")
+    if open_alerts:
+        problems.append(f"открытых алертов: {open_alerts}")
+    if failed_blocking and not open_quarantine:
+        # Блокирующие провалы уже разобраны, но умолчать о них нельзя.
+        problems.append(f"блокирующих провалов проверок: {failed_blocking}")
+    if problems:
+        return "Требует внимания: " + ", ".join(problems)
+
+    if failed_warning:
+        return (
+            "Данные полные, все сбои восстановились автоматически; "
+            f"замечаний уровня предупреждения: {failed_warning} - данные приняты, разбор не требуется"
+        )
+    return "Данные полные, все сбои восстановились автоматически, вмешательство не требуется"
 
 
 def overview(session: Session) -> dict[str, Any]:
@@ -491,6 +575,18 @@ def render_markdown(report: PeriodReport) -> str:
         "",
         f"**Вывод: {report.verdict}**",
         "",
+    ]
+
+    demo_runs = sum(v["runs"] for v in report.versions if v["version"] == "demo-seed")
+    if demo_runs:
+        lines += [
+            f"> Внимание: {demo_runs} прогонов в периоде помечены версией кода `demo-seed` - "
+            "это синтетические инциденты, залитые для демонстрации отчёта на молодом стенде. "
+            "Удаляются целиком командой `make seed-clean`.",
+            "",
+        ]
+
+    lines += [
         "## 1. Покрытие данными",
         "",
         "| Показатель | Значение |",
@@ -543,7 +639,8 @@ def render_markdown(report: PeriodReport) -> str:
         "",
         f"Всего изменений ранее полученных значений: **{rev['total']}**, "
         f"из них значимых: **{rev['significant']}**, "
-        f"вне окна перезапроса: **{rev['late']}**. "
+        f"вне окна перезапроса: **{rev['late']}**, "
+        f"возвратов к прежнему значению: **{rev.get('rollbacks', 0)}**. "
         f"Максимальное расхождение: {rev['max_delta_pct']:.4f}%.",
         "",
     ]
@@ -564,8 +661,30 @@ def render_markdown(report: PeriodReport) -> str:
         lines.append(f"| {title} | {stats.get('pass', 0)} | {stats.get('fail', 0)} | {stats.get('skip', 0)} |")
     lines += [
         "",
-        f"В карантине за период: {q['quarantine']['total']}, из них не разобрано: {q['quarantine']['open']}.",
+        f"В карантине за период: {q['quarantine']['total']}, из них не разобрано: {q['quarantine']['open']}. "
+        f"Провалов уровня «карантин»: {q.get('failed_blocking', 0)}, "
+        f"уровня «предупреждение»: {q.get('failed_warning', 0)}.",
         "",
+    ]
+
+    open_alerts = q.get("open_alerts", [])
+    if open_alerts:
+        lines += [
+            f"Открытых алертов: {q.get('alerts_open', len(open_alerts))} - условие ещё не вернулось в норму.",
+            "",
+            "| Серьёзность | Событие | Срабатываний | Последнее |",
+            "|---|---|---|---|",
+        ]
+        for alert in open_alerts:
+            lines.append(
+                f"| {alert['severity']} | {alert['title']} | {alert['fire_count']} | "
+                f"{alert['last_fired_at'][:16].replace('T', ' ')} |"
+            )
+        lines.append("")
+    else:
+        lines += ["Открытых алертов нет: все сработавшие условия вернулись в норму.", ""]
+
+    lines += [
         "## 6. Версии кода в периоде",
         "",
         "| Версия | С | По | Прогонов |",
