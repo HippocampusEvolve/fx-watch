@@ -1,10 +1,19 @@
 # fx-watch
 
+[![CI](https://github.com/HippocampusEvolve/fx-watch/actions/workflows/ci.yml/badge.svg)](https://github.com/HippocampusEvolve/fx-watch/actions/workflows/ci.yml)
+
 Сервис регулярно забирает данные из открытого источника, хранит их так, что видна вся история
 изменений, и следит за тем, чтобы данные не сломались незаметно.
 
 **Живой стенд:** https://antonov-ai.ru/agents/fxwatch/ - работает прямо сейчас, цифры на дашборде
-приходят из этого сервиса.
+приходят из этого сервиса. Проверить это можно не поднимая контейнеры и не читая код:
+
+| Что отдаёт | Ссылка |
+|---|---|
+| Состояние источников, предохранителя и живости задач | [/api/fxwatch/health](https://antonov-ai.ru/api/fxwatch/health) |
+| Покрытие за 90 дней, счётчики, последние курсы | [/api/fxwatch/overview](https://antonov-ai.ru/api/fxwatch/overview) |
+| Отчёт за период целиком, как его собирает сервис | [/api/fxwatch/report.md](https://antonov-ai.ru/api/fxwatch/report.md) |
+| Остальные маршруты: история, ревизии, прогоны, проверки, карантин | [/api/fxwatch/docs](https://antonov-ai.ru/api/fxwatch/docs) |
 
 **Коротко и на одной странице** - источник, стек, спорные решения, что доработал бы:
 [SUBMISSION.md](SUBMISSION.md). Ниже то же самое подробно.

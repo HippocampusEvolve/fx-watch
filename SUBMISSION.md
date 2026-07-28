@@ -9,6 +9,14 @@
 | Живой стенд | https://antonov-ai.ru/agents/fxwatch/ - сервис работает на сервере, цифры на дашборде свои |
 | Запуск локально | `docker compose up -d`, ключей и учётных записей не требуется |
 | Отчёт за период | `make report`, пример готового: [reports/](reports/) |
+| Состояние сервиса прямо сейчас | [/api/fxwatch/health](https://antonov-ai.ru/api/fxwatch/health) |
+| Покрытие, счётчики, последние курсы | [/api/fxwatch/overview](https://antonov-ai.ru/api/fxwatch/overview) |
+| Живой отчёт за 90 дней | [/api/fxwatch/report.md](https://antonov-ai.ru/api/fxwatch/report.md) |
+| Все маршруты API | [/api/fxwatch/docs](https://antonov-ai.ru/api/fxwatch/docs) |
+
+Проверка работоспособности не требует ни установки, ни доверия к описанию: четыре ссылки выше
+отвечают живыми данными, а зелёный бейдж CI в шапке README означает, что на последнем коммите
+прошли линтер, 54 теста, сборка образа и миграции на чистой базе.
 
 ---
 
